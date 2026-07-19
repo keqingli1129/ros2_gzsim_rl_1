@@ -1,0 +1,15 @@
+[project]
+name = "ros2-gzsim-rl-1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "opencv-python-headless>=5.0.0",
+    "stable-baselines3[extra]>=2.9.0",
+]
+
+[tool.uv]
+override-dependencies = [
+    "opencv-python-headless>=5.0.0",
+]
