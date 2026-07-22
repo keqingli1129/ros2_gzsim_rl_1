@@ -174,19 +174,11 @@ def pose_cb(msg):
                 _latest_state["pole_pose"] = math.asin(sinp)
                 _latest_state["ready"] = True
 
-def main():
+def run_inference(model):
     """
-    Train PPO on the cart-pole (headless), then launch a Gazebo server + GUI
-    and run inference over Gazebo transport until Ctrl+C.
+    Launch a Gazebo server + GUI and drive the trained model over Gazebo
+    transport until Ctrl+C.
     """
-    # --- Training (headless, in-process) ---
-    env = CustomCartPole({})
-    model = PPO("MlpPolicy", env, verbose=1, device="cpu")
-    model.learn(total_timesteps=25_000)
-    model.save(os.path.join(file_path, "cart_pole_ppo"))
-    print("Training complete. Saved model to cart_pole_ppo.zip")
-
-    # --- Inference with GUI via Gazebo transport ---
     # Launch gz sim with GUI
     sdf_path = os.path.join(file_path, "cart_pole.sdf")
     print("Launching Gazebo server...")
@@ -239,6 +231,21 @@ def main():
         gz_server.terminate()
         gz_gui.wait()
         gz_server.wait()
+
+
+def main():
+    """
+    Train PPO on the cart-pole (headless), then run inference with a GUI.
+    """
+    # --- Training (headless, in-process) ---
+    env = CustomCartPole({})
+    model = PPO("MlpPolicy", env, verbose=1, device="cpu")
+    model.learn(total_timesteps=25_000)
+    model.save(os.path.join(file_path, "cart_pole_ppo"))
+    print("Training complete. Saved model to cart_pole_ppo.zip")
+
+    # --- Inference with GUI via Gazebo transport ---
+    run_inference(model)
 
 
 if __name__ == "__main__":
