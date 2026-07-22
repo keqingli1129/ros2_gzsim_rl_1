@@ -14,6 +14,14 @@ import time
 import subprocess
 import threading
 
+# --- Inference-time imports (Gazebo transport) ---
+from gz.transport13 import Node
+from gz.msgs10.entity_wrench_pb2 import EntityWrench
+from gz.msgs10.wrench_pb2 import Wrench
+from gz.msgs10.vector3d_pb2 import Vector3d as Vector3dMsg
+from gz.msgs10.entity_pb2 import Entity
+from gz.msgs10.pose_v_pb2 import Pose_V
+
 file_path = os.path.dirname(os.path.realpath(__file__))
 
 def run_gui():
@@ -140,20 +148,6 @@ class CustomCartPole(gym.Env):
         obs, reward, done, truncated, info = self.env.step(action)
         return  obs, reward, done, truncated, info
 
-env = CustomCartPole({})
-model = PPO("MlpPolicy", env, verbose=1, device="cpu")
-model.learn(total_timesteps=25_000)
-model.save(os.path.join(file_path, "cart_pole_ppo"))
-print("Training complete. Saved model to cart_pole_ppo.zip")
-
-# --- Inference with GUI via Gazebo transport ---
-from gz.transport13 import Node
-from gz.msgs10.entity_wrench_pb2 import EntityWrench
-from gz.msgs10.wrench_pb2 import Wrench
-from gz.msgs10.vector3d_pb2 import Vector3d as Vector3dMsg
-from gz.msgs10.entity_pb2 import Entity
-from gz.msgs10.pose_v_pb2 import Pose_V
-
 # State shared between the subscriber callback and the main loop
 _state_lock = threading.Lock()
 _latest_state = {
@@ -180,55 +174,72 @@ def pose_cb(msg):
                 _latest_state["pole_pose"] = math.asin(sinp)
                 _latest_state["ready"] = True
 
-# Launch gz sim with GUI
-sdf_path = os.path.join(file_path, "cart_pole.sdf")
-print("Launching Gazebo server...")
-gz_server = subprocess.Popen(["gz", "sim", "-s", "-r", sdf_path])
-time.sleep(3)
+def main():
+    """
+    Train PPO on the cart-pole (headless), then launch a Gazebo server + GUI
+    and run inference over Gazebo transport until Ctrl+C.
+    """
+    # --- Training (headless, in-process) ---
+    env = CustomCartPole({})
+    model = PPO("MlpPolicy", env, verbose=1, device="cpu")
+    model.learn(total_timesteps=25_000)
+    model.save(os.path.join(file_path, "cart_pole_ppo"))
+    print("Training complete. Saved model to cart_pole_ppo.zip")
 
-print("Launching Gazebo GUI...")
-gz_gui = subprocess.Popen(["gz", "sim", "-g"])
-time.sleep(5)  # Wait for GUI to connect
+    # --- Inference with GUI via Gazebo transport ---
+    # Launch gz sim with GUI
+    sdf_path = os.path.join(file_path, "cart_pole.sdf")
+    print("Launching Gazebo server...")
+    gz_server = subprocess.Popen(["gz", "sim", "-s", "-r", sdf_path])
+    time.sleep(3)
 
-node = Node()
+    print("Launching Gazebo GUI...")
+    gz_gui = subprocess.Popen(["gz", "sim", "-g"])
+    time.sleep(5)  # Wait for GUI to connect
 
-# Subscribe to dynamic pose info
-node.subscribe(Pose_V, "/world/cart_pole/dynamic_pose/info", pose_cb)
+    node = Node()
 
-# Advertise on the wrench topic
-wrench_pub = node.advertise("/world/cart_pole/wrench", EntityWrench)
-time.sleep(1)
+    # Subscribe to dynamic pose info
+    node.subscribe(Pose_V, "/world/cart_pole/dynamic_pose/info", pose_cb)
 
-print("Running inference with GUI... Press Ctrl+C to stop.")
-try:
-    obs = np.zeros(4, dtype=np.float32)
-    for i in range(50000):
-        action, _s = model.predict(obs, deterministic=True)
+    # Advertise on the wrench topic
+    wrench_pub = node.advertise("/world/cart_pole/wrench", EntityWrench)
+    time.sleep(1)
 
-        # Apply force based on action
-        msg = EntityWrench()
-        msg.entity.name = "vehicle_green"
-        msg.entity.type = 2  # MODEL type
-        force_x = 2000.0 if action == 1 else -2000.0
-        msg.wrench.force.x = force_x
-        msg.wrench.force.y = 0.0
-        msg.wrench.force.z = 0.0
-        wrench_pub.publish(msg)
+    print("Running inference with GUI... Press Ctrl+C to stop.")
+    try:
+        obs = np.zeros(4, dtype=np.float32)
+        for i in range(50000):
+            action, _s = model.predict(obs, deterministic=True)
 
-        time.sleep(0.005)  # ~5ms per step to match sim time
+            # Apply force based on action
+            msg = EntityWrench()
+            msg.entity.name = "vehicle_green"
+            msg.entity.type = 2  # MODEL type
+            force_x = 2000.0 if action == 1 else -2000.0
+            msg.wrench.force.x = force_x
+            msg.wrench.force.y = 0.0
+            msg.wrench.force.z = 0.0
+            wrench_pub.publish(msg)
 
-        with _state_lock:
-            obs = np.array([
-                _latest_state["cart_pose"],
-                _latest_state["cart_vel"],
-                _latest_state["pole_pose"],
-                _latest_state["pole_angular_vel"],
-            ], dtype=np.float32)
+            time.sleep(0.005)  # ~5ms per step to match sim time
 
-except KeyboardInterrupt:
-    print("\nStopping...")
-finally:
-    gz_gui.terminate()
-    gz_server.terminate()
-    gz_gui.wait()
-    gz_server.wait()
+            with _state_lock:
+                obs = np.array([
+                    _latest_state["cart_pose"],
+                    _latest_state["cart_vel"],
+                    _latest_state["pole_pose"],
+                    _latest_state["pole_angular_vel"],
+                ], dtype=np.float32)
+
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        gz_gui.terminate()
+        gz_server.terminate()
+        gz_gui.wait()
+        gz_server.wait()
+
+
+if __name__ == "__main__":
+    main()
