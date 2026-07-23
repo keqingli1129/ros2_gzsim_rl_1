@@ -1,5 +1,8 @@
 {
     "python.analysis.extraPaths": [
         "/usr/lib/python3/dist-packages"
-    ]
+    ],
+    "terminal.integrated.env.linux": {
+        "PYTHONPATH": "/usr/lib/python3/dist-packages"
+    }
 }

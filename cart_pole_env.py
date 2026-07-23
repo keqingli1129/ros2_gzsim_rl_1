@@ -1,3 +1,4 @@
+import argparse
 import os
 import ctypes
 ctypes.CDLL("/usr/lib/x86_64-linux-gnu/libgz-sim8.so", ctypes.RTLD_GLOBAL)
@@ -10,6 +11,7 @@ from gz.sim8 import TestFixture, World, world_entity, Model, Link
 from gz.math7 import Vector3d
 
 from stable_baselines3 import PPO
+import math
 import time
 import subprocess
 import threading
@@ -126,6 +128,17 @@ class GzRewardScorer:
         obs, reward_, term_, tunc_, other_= self.step(None, paused=False)
         return obs, {}
 
+    def close(self):
+        """
+        Drop references to the in-process fixture/server so their pybind11
+        destructors run and release the transport node. Needed before
+        run_inference spawns a separate out-of-process server under the
+        same world name - otherwise both stay registered at once and the
+        GUI can attach to the wrong (stale) one.
+        """
+        self.server = None
+        self.fixture = None
+
 
 
 class CustomCartPole(gym.Env):
@@ -148,6 +161,9 @@ class CustomCartPole(gym.Env):
         obs, reward, done, truncated, info = self.env.step(action)
         return  obs, reward, done, truncated, info
 
+    def close(self):
+        self.env.close()
+
 # State shared between the subscriber callback and the main loop
 _state_lock = threading.Lock()
 _latest_state = {
@@ -157,57 +173,141 @@ _latest_state = {
     "pole_angular_vel": 0.0,
     "ready": False,
 }
+# Previous reading per entity, used to estimate velocity by finite difference
+# since Pose_V only carries positions.
+_prev_pose_state = {
+    "cart_pose": None,
+    "pole_pose": None,
+    "time": None,
+}
+
+def _quat_mult(q1, q2):
+    """Hamilton product of two (w, x, y, z) quaternions."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return (
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    )
+
+def _quat_rotate(q, v):
+    """Rotate vector v=(x,y,z) by quaternion q=(w,x,y,z)."""
+    w, x, y, z = q
+    vx, vy, vz = v
+    tx = 2.0 * (y*vz - z*vy)
+    ty = 2.0 * (z*vx - x*vz)
+    tz = 2.0 * (x*vy - y*vx)
+    return (
+        vx + w*tx + (y*tz - z*ty),
+        vy + w*ty + (z*tx - x*tz),
+        vz + w*tz + (x*ty - y*tx),
+    )
+
+def _pitch_from_quat(q):
+    """Extract Y-axis pitch from a (w, x, y, z) quaternion."""
+    w, x, y, z = q
+    sinp = 2.0 * (w*y - z*x)
+    sinp = max(-1.0, min(1.0, sinp))
+    return math.asin(sinp)
 
 def pose_cb(msg):
-    """Subscribe to dynamic pose updates to read cart and pole state."""
+    """Subscribe to pose updates to read cart and pole state.
+
+    This topic reports the model's own pose in world frame, but every link
+    under it (chassis, pole, ...) relative to the model frame instead of
+    world frame. Training reads genuine world poses via Link.world_pose, so
+    we compose model pose + local link pose into world frame here to match.
+    Pose_V also only carries positions, so velocities are estimated by
+    finite-differencing consecutive world-frame readings against wall-clock
+    time.
+    """
+    poses = {}
+    for pose in msg.pose:
+        p, q = pose.position, pose.orientation
+        poses[pose.name] = ((p.x, p.y, p.z), (q.w, q.x, q.y, q.z))
+
+    if not {"vehicle_green", "chassis", "pole"} <= poses.keys():
+        return
+
+    model_pos, model_quat = poses["vehicle_green"]
+    chassis_local_pos, _ = poses["chassis"]
+    _, pole_local_quat = poses["pole"]
+
+    cart_pose = model_pos[0] + _quat_rotate(model_quat, chassis_local_pos)[0]
+    pole_pose = _pitch_from_quat(_quat_mult(model_quat, pole_local_quat))
+
     with _state_lock:
-        for pose in msg.pose:
-            if pose.name == "vehicle_green::chassis":
-                _latest_state["cart_pose"] = pose.position.x
-            elif pose.name == "vehicle_green::pole":
-                # Extract pitch (Y rotation) from quaternion
-                q = pose.orientation
-                # pitch from quaternion: atan2(2*(qw*qy - qz*qx), 1 - 2*(qx^2 + qy^2))
-                import math
-                sinp = 2.0 * (q.w * q.y - q.z * q.x)
-                sinp = max(-1.0, min(1.0, sinp))
-                _latest_state["pole_pose"] = math.asin(sinp)
-                _latest_state["ready"] = True
+        now = time.monotonic()
+        prev_time = _prev_pose_state["time"]
+        dt = now - prev_time if prev_time is not None else None
+
+        prev_cart_pose = _prev_pose_state["cart_pose"]
+        if dt and prev_cart_pose is not None:
+            _latest_state["cart_vel"] = (cart_pose - prev_cart_pose) / dt
+        _latest_state["cart_pose"] = cart_pose
+        _prev_pose_state["cart_pose"] = cart_pose
+
+        prev_pole_pose = _prev_pose_state["pole_pose"]
+        if dt and prev_pole_pose is not None:
+            _latest_state["pole_angular_vel"] = (pole_pose - prev_pole_pose) / dt
+        _latest_state["pole_pose"] = pole_pose
+        _prev_pose_state["pole_pose"] = pole_pose
+
+        _latest_state["ready"] = True
+        _prev_pose_state["time"] = now
+
+def _kill_stale_gz_processes():
+    """Terminate any gz sim server/GUI left over from a prior run.
+
+    A leftover server registers on the same transport bus under the same
+    world name as the one we're about to launch, and the new GUI can attach
+    to that stale instance instead of ours, showing blank or wrong content.
+    """
+    subprocess.run(["pkill", "-f", "gz sim"], check=False)
+    time.sleep(1)
 
 def run_inference(model):
     """
     Launch a Gazebo server + GUI and drive the trained model over Gazebo
     transport until Ctrl+C.
     """
-    # Launch gz sim with GUI
+    _kill_stale_gz_processes()
+
     sdf_path = os.path.join(file_path, "cart_pole.sdf")
-    print("Launching Gazebo server...")
-    gz_server = subprocess.Popen(["gz", "sim", "-s", "-r", sdf_path])
-    time.sleep(3)
-
-    print("Launching Gazebo GUI...")
-    gz_gui = subprocess.Popen(["gz", "sim", "-g"])
-    time.sleep(5)  # Wait for GUI to connect
-
-    node = Node()
-
-    # Subscribe to dynamic pose info
-    node.subscribe(Pose_V, "/world/cart_pole/dynamic_pose/info", pose_cb)
-
-    # Advertise on the wrench topic
-    wrench_pub = node.advertise("/world/cart_pole/wrench", EntityWrench)
-    time.sleep(1)
-
-    print("Running inference with GUI... Press Ctrl+C to stop.")
+    gz_server = None
+    gz_gui = None
     try:
+        print("Launching Gazebo server...")
+        gz_server = subprocess.Popen(["gz", "sim", "-s", "-r", sdf_path])
+        time.sleep(3)
+
+        print("Launching Gazebo GUI...")
+        gz_gui = subprocess.Popen(["gz", "sim", "-g"])
+        time.sleep(5)  # Wait for GUI to connect
+
+        node = Node()
+
+        # Subscribe to dynamic pose info
+        node.subscribe(Pose_V, "/world/cart_pole/dynamic_pose/info", pose_cb)
+
+        # Advertise on the wrench topic
+        wrench_pub = node.advertise("/world/cart_pole/wrench", EntityWrench)
+        time.sleep(1)
+
+        print("Running inference with GUI... Press Ctrl+C to stop.")
         obs = np.zeros(4, dtype=np.float32)
-        for i in range(50000):
+        for _ in range(50000):
             action, _s = model.predict(obs, deterministic=True)
 
-            # Apply force based on action
+            # Apply force to the chassis link directly, matching training.
+            # Entity name must be unscoped ("chassis", not
+            # "vehicle_green::chassis") - this world's transport topics only
+            # match against links' bare names, confirmed via pose_cb.
             msg = EntityWrench()
-            msg.entity.name = "vehicle_green"
-            msg.entity.type = 2  # MODEL type
+            msg.entity.name = "chassis"
+            msg.entity.type = 3  # LINK type
             force_x = 2000.0 if action == 1 else -2000.0
             msg.wrench.force.x = force_x
             msg.wrench.force.y = 0.0
@@ -227,22 +327,41 @@ def run_inference(model):
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
-        gz_gui.terminate()
-        gz_server.terminate()
-        gz_gui.wait()
-        gz_server.wait()
+        for proc in (gz_gui, gz_server):
+            if proc is not None:
+                proc.terminate()
+        for proc in (gz_gui, gz_server):
+            if proc is not None:
+                proc.wait()
 
 
 def main():
     """
     Train PPO on the cart-pole (headless), then run inference with a GUI.
+    Pass --infer-only to skip training and load the previously saved model.
     """
-    # --- Training (headless, in-process) ---
-    env = CustomCartPole({})
-    model = PPO("MlpPolicy", env, verbose=1, device="cpu")
-    model.learn(total_timesteps=25_000)
-    model.save(os.path.join(file_path, "cart_pole_ppo"))
-    print("Training complete. Saved model to cart_pole_ppo.zip")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--infer-only", action="store_true",
+        help="Skip training and run inference with the saved cart_pole_ppo.zip")
+    args = parser.parse_args()
+
+    model_path = os.path.join(file_path, "cart_pole_ppo")
+
+    if args.infer_only:
+        model = PPO.load(model_path)
+        print(f"Loaded model from {model_path}.zip")
+    else:
+        # --- Training (headless, in-process) ---
+        env = CustomCartPole({})
+        model = PPO("MlpPolicy", env, verbose=1, device="auto")
+        model.learn(total_timesteps=25_000)
+        model.save(model_path)
+        print("Training complete. Saved model to cart_pole_ppo.zip")
+
+        # Release the in-process training world before the inference server
+        # (spawned below, out-of-process, under the same world name) starts.
+        env.close()
 
     # --- Inference with GUI via Gazebo transport ---
     run_inference(model)
