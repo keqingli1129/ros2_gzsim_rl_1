@@ -23,6 +23,8 @@ from gz.msgs10.wrench_pb2 import Wrench
 from gz.msgs10.vector3d_pb2 import Vector3d as Vector3dMsg
 from gz.msgs10.entity_pb2 import Entity
 from gz.msgs10.pose_v_pb2 import Pose_V
+from gz.msgs10.world_control_pb2 import WorldControl
+from gz.msgs10.boolean_pb2 import Boolean
 
 file_path = os.path.dirname(os.path.realpath(__file__))
 
@@ -220,8 +222,11 @@ def pose_cb(msg):
     world frame. Training reads genuine world poses via Link.world_pose, so
     we compose model pose + local link pose into world frame here to match.
     Pose_V also only carries positions, so velocities are estimated by
-    finite-differencing consecutive world-frame readings against wall-clock
-    time.
+    finite-differencing consecutive world-frame readings against the
+    message's sim-time stamp (msg.header.stamp) rather than wall-clock time -
+    wall-clock deltas pick up scheduling/network jitter between messages that
+    has nothing to do with the sim's actual timestep, producing much noisier
+    velocity estimates than training ever sees.
     """
     poses = {}
     for pose in msg.pose:
@@ -239,9 +244,12 @@ def pose_cb(msg):
     pole_pose = _pitch_from_quat(_quat_mult(model_quat, pole_local_quat))
 
     with _state_lock:
-        now = time.monotonic()
+        now = msg.header.stamp.sec + msg.header.stamp.nsec * 1e-9
         prev_time = _prev_pose_state["time"]
         dt = now - prev_time if prev_time is not None else None
+        if dt is not None and dt <= 0:
+            # Sim-time reset (e.g. world reset) or a duplicate stamp.
+            dt = None
 
         prev_cart_pose = _prev_pose_state["cart_pose"]
         if dt and prev_cart_pose is not None:
@@ -267,6 +275,33 @@ def _kill_stale_gz_processes():
     """
     subprocess.run(["pkill", "-f", "gz sim"], check=False)
     time.sleep(1)
+
+def _reset_world(node):
+    """Reset the running world via its control service.
+
+    Without this, a fallen/out-of-bounds cart-pole keeps getting shoved by
+    the policy's forces indefinitely: positions grow unbounded until they
+    exceed what the physics engine's collision AABB math can represent,
+    crashing the server (ODE assertion "aabbBound ... dMaxIntExact").
+    """
+    request = WorldControl()
+    request.reset.all = True
+    node.request(
+        "/world/cart_pole/control", request, WorldControl, Boolean, 5000)
+    with _state_lock:
+        # Clear stale (out-of-bounds) readings too, not just the velocity
+        # trackers - otherwise the next loop iteration reads last episode's
+        # values before pose_cb delivers a post-reset message, and the
+        # bounds check fires again immediately.
+        _latest_state["cart_pose"] = 0.0
+        _latest_state["cart_vel"] = 0.0
+        _latest_state["pole_pose"] = 0.0
+        _latest_state["pole_angular_vel"] = 0.0
+        _latest_state["ready"] = False
+        _prev_pose_state["cart_pose"] = None
+        _prev_pose_state["pole_pose"] = None
+        _prev_pose_state["time"] = None
+
 
 def run_inference(model):
     """
@@ -324,6 +359,16 @@ def run_inference(model):
                     _latest_state["pole_angular_vel"],
                 ], dtype=np.float32)
 
+            # Same bounds training uses to end an episode. Inference has no
+            # episode boundary of its own, so without this the policy keeps
+            # applying force to an already-fallen/out-of-bounds cart forever.
+            cart_pose, pole_pose = obs[0], obs[2]
+            if pole_pose > 0.48 or pole_pose < -0.48 or cart_pose > 4.8 or cart_pose < -4.8:
+                print("Cart-pole out of bounds, resetting world...")
+                _reset_world(node)
+                time.sleep(0.5)  # let the reset propagate before next pose_cb
+                obs = np.zeros(4, dtype=np.float32)
+
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
@@ -355,7 +400,7 @@ def main():
         # --- Training (headless, in-process) ---
         env = CustomCartPole({})
         model = PPO("MlpPolicy", env, verbose=1, device="auto")
-        model.learn(total_timesteps=25_000)
+        model.learn(total_timesteps=100_000)
         model.save(model_path)
         print("Training complete. Saved model to cart_pole_ppo.zip")
 
