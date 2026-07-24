@@ -14,7 +14,6 @@ from stable_baselines3 import PPO
 import math
 import time
 import subprocess
-import threading
 
 # --- Inference-time imports (Gazebo transport) ---
 from gz.transport13 import Node
@@ -22,7 +21,6 @@ from gz.msgs10.entity_wrench_pb2 import EntityWrench
 from gz.msgs10.wrench_pb2 import Wrench
 from gz.msgs10.vector3d_pb2 import Vector3d as Vector3dMsg
 from gz.msgs10.entity_pb2 import Entity
-from gz.msgs10.pose_v_pb2 import Pose_V
 from gz.msgs10.world_control_pb2 import WorldControl
 from gz.msgs10.boolean_pb2 import Boolean
 from gz.msgs10.empty_pb2 import Empty
@@ -168,23 +166,6 @@ class CustomCartPole(gym.Env):
     def close(self):
         self.env.close()
 
-# State shared between the subscriber callback and the main loop
-_state_lock = threading.Lock()
-_latest_state = {
-    "cart_pose": 0.0,
-    "cart_vel": 0.0,
-    "pole_pose": 0.0,
-    "pole_angular_vel": 0.0,
-    "ready": False,
-}
-# Previous reading per entity, used to estimate velocity by finite difference
-# since Pose_V only carries positions.
-_prev_pose_state = {
-    "cart_pose": None,
-    "pole_pose": None,
-    "time": None,
-}
-
 def _quat_mult(q1, q2):
     """Hamilton product of two (w, x, y, z) quaternions."""
     w1, x1, y1, z1 = q1
@@ -324,58 +305,6 @@ def _world_frame_pose(names_by_id, pose_text_by_id, entity_ids):
     pole_pose = _pitch_from_quat(_quat_mult(model_quat, pole_local_quat))
     return cart_pose, pole_pose
 
-def pose_cb(msg):
-    """Subscribe to pose updates to read cart and pole state.
-
-    This topic reports the model's own pose in world frame, but every link
-    under it (chassis, pole, ...) relative to the model frame instead of
-    world frame. Training reads genuine world poses via Link.world_pose, so
-    we compose model pose + local link pose into world frame here to match.
-    Pose_V also only carries positions, so velocities are estimated by
-    finite-differencing consecutive world-frame readings against the
-    message's sim-time stamp (msg.header.stamp) rather than wall-clock time -
-    wall-clock deltas pick up scheduling/network jitter between messages that
-    has nothing to do with the sim's actual timestep, producing much noisier
-    velocity estimates than training ever sees.
-    """
-    poses = {}
-    for pose in msg.pose:
-        p, q = pose.position, pose.orientation
-        poses[pose.name] = ((p.x, p.y, p.z), (q.w, q.x, q.y, q.z))
-
-    if not {"vehicle_green", "chassis", "pole"} <= poses.keys():
-        return
-
-    model_pos, model_quat = poses["vehicle_green"]
-    chassis_local_pos, _ = poses["chassis"]
-    _, pole_local_quat = poses["pole"]
-
-    cart_pose = model_pos[0] + _quat_rotate(model_quat, chassis_local_pos)[0]
-    pole_pose = _pitch_from_quat(_quat_mult(model_quat, pole_local_quat))
-
-    with _state_lock:
-        now = msg.header.stamp.sec + msg.header.stamp.nsec * 1e-9
-        prev_time = _prev_pose_state["time"]
-        dt = now - prev_time if prev_time is not None else None
-        if dt is not None and dt <= 0:
-            # Sim-time reset (e.g. world reset) or a duplicate stamp.
-            dt = None
-
-        prev_cart_pose = _prev_pose_state["cart_pose"]
-        if dt and prev_cart_pose is not None:
-            _latest_state["cart_vel"] = (cart_pose - prev_cart_pose) / dt
-        _latest_state["cart_pose"] = cart_pose
-        _prev_pose_state["cart_pose"] = cart_pose
-
-        prev_pole_pose = _prev_pose_state["pole_pose"]
-        if dt and prev_pole_pose is not None:
-            _latest_state["pole_angular_vel"] = (pole_pose - prev_pole_pose) / dt
-        _latest_state["pole_pose"] = pole_pose
-        _prev_pose_state["pole_pose"] = pole_pose
-
-        _latest_state["ready"] = True
-        _prev_pose_state["time"] = now
-
 def _kill_stale_gz_processes():
     """Terminate any gz sim server/GUI left over from a prior run.
 
@@ -398,19 +327,6 @@ def _reset_world(node):
     request.reset.all = True
     node.request(
         "/world/cart_pole/control", request, WorldControl, Boolean, 5000)
-    with _state_lock:
-        # Clear stale (out-of-bounds) readings too, not just the velocity
-        # trackers - otherwise the next loop iteration reads last episode's
-        # values before pose_cb delivers a post-reset message, and the
-        # bounds check fires again immediately.
-        _latest_state["cart_pose"] = 0.0
-        _latest_state["cart_vel"] = 0.0
-        _latest_state["pole_pose"] = 0.0
-        _latest_state["pole_angular_vel"] = 0.0
-        _latest_state["ready"] = False
-        _prev_pose_state["cart_pose"] = None
-        _prev_pose_state["pole_pose"] = None
-        _prev_pose_state["time"] = None
 
 
 def run_inference(model):
@@ -434,22 +350,31 @@ def run_inference(model):
 
         node = Node()
 
-        # Subscribe to dynamic pose info
-        node.subscribe(Pose_V, "/world/cart_pole/dynamic_pose/info", pose_cb)
-
         # Advertise on the wrench topic
         wrench_pub = node.advertise("/world/cart_pole/wrench", EntityWrench)
         time.sleep(1)
 
+        entity_ids = _resolve_target_entities(node)
+        _query_world_state(node)  # warm-up call; first request has ~200ms
+                                   # one-time connection setup cost that
+                                   # would otherwise skew the first loop
+                                   # iteration's timing measurement below.
+
         print("Running inference with GUI... Press Ctrl+C to stop.")
         obs = np.zeros(4, dtype=np.float32)
+        prev_cart_pose = None
+        prev_pole_pose = None
+        prev_sim_time = None
+        target_period = 0.005  # match training's 5ms (5 x 1ms) action cadence
         for _ in range(50000):
+            loop_start = time.monotonic()
             action, _s = model.predict(obs, deterministic=True)
 
             # Apply force to the chassis link directly, matching training.
             # Entity name must be unscoped ("chassis", not
             # "vehicle_green::chassis") - this world's transport topics only
-            # match against links' bare names, confirmed via pose_cb.
+            # match against links' bare names, confirmed via the ECS state
+            # query's Name components.
             msg = EntityWrench()
             msg.entity.name = "chassis"
             msg.entity.type = 3  # LINK type
@@ -459,15 +384,29 @@ def run_inference(model):
             msg.wrench.force.z = 0.0
             wrench_pub.publish(msg)
 
-            time.sleep(0.005)  # ~5ms per step to match sim time
+            sim_time, names_by_id, pose_text_by_id = _query_world_state(node)
+            frame = _world_frame_pose(names_by_id, pose_text_by_id, entity_ids)
 
-            with _state_lock:
-                obs = np.array([
-                    _latest_state["cart_pose"],
-                    _latest_state["cart_vel"],
-                    _latest_state["pole_pose"],
-                    _latest_state["pole_angular_vel"],
-                ], dtype=np.float32)
+            if frame is not None and sim_time is not None:
+                cart_pose, pole_pose = frame
+                dt = (sim_time - prev_sim_time
+                      if prev_sim_time is not None else None)
+                if dt is not None and dt <= 0:
+                    # Sim-time reset (world reset) or a duplicate reading.
+                    dt = None
+
+                cart_vel = ((cart_pose - prev_cart_pose) / dt
+                            if dt and prev_cart_pose is not None
+                            else obs[1])
+                pole_angular_vel = ((pole_pose - prev_pole_pose) / dt
+                                     if dt and prev_pole_pose is not None
+                                     else obs[3])
+
+                obs = np.array(
+                    [cart_pose, cart_vel, pole_pose, pole_angular_vel],
+                    dtype=np.float32)
+                prev_cart_pose, prev_pole_pose, prev_sim_time = (
+                    cart_pose, pole_pose, sim_time)
 
             # Same bounds training uses to end an episode. Inference has no
             # episode boundary of its own, so without this the policy keeps
@@ -476,8 +415,16 @@ def run_inference(model):
             if pole_pose > 0.48 or pole_pose < -0.48 or cart_pose > 4.8 or cart_pose < -4.8:
                 print("Cart-pole out of bounds, resetting world...")
                 _reset_world(node)
-                time.sleep(0.5)  # let the reset propagate before next pose_cb
+                time.sleep(0.5)  # let the reset propagate before next query
                 obs = np.zeros(4, dtype=np.float32)
+                prev_cart_pose = None
+                prev_pole_pose = None
+                prev_sim_time = None
+
+            elapsed = time.monotonic() - loop_start
+            remaining = target_period - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
     except KeyboardInterrupt:
         print("\nStopping...")
