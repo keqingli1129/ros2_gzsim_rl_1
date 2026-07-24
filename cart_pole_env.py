@@ -45,16 +45,33 @@ class GzRewardScorer:
         to load our gazebo world. We also inject the code to be executed
         on each run.
         """
-        self.fixture = TestFixture(os.path.join(file_path, 'cart_pole.sdf'))
-        self.fixture.on_pre_update(self.on_pre_update)
-        self.fixture.on_post_update(self.on_post_update)
         self.command = None # This variable is used as a bridge between Gymnasium and gazebo
-        self.fixture.finalize()
-        self.server = self.fixture.server()
+        self._build_fixture()
         self.terminated = False
         self._initialized = False
         self.state = np.zeros(4, dtype=np.float32)
         self.reward = 0.0
+
+    def _build_fixture(self):
+        """
+        Load a fresh TestFixture/Server pair.
+
+        server.reset_all() leaves the physics engine desynced from the ECM:
+        gravity-driven dynamics keep working, but Link.add_world_force() and
+        velocity reads silently stop taking effect for the rest of the
+        process (verified live - the chassis entity ID is unchanged before
+        and after reset_all(), so it isn't a stale-handle issue; it's
+        specific to that call). Tearing down and rebuilding the TestFixture
+        avoids this entirely, since a freshly loaded fixture always has
+        working force application.
+        """
+        self.server = None
+        self.fixture = None
+        self.fixture = TestFixture(os.path.join(file_path, 'cart_pole.sdf'))
+        self.fixture.on_pre_update(self.on_pre_update)
+        self.fixture.on_post_update(self.on_post_update)
+        self.fixture.finalize()
+        self.server = self.fixture.server()
 
     def _ensure_initialized(self, ecm):
         """Look up entities if not yet initialized (or after a reset)."""
@@ -121,9 +138,10 @@ class GzRewardScorer:
 
     def reset(self):
         """
-        This function simply resets the server
+        This function rebuilds the fixture/server rather than calling
+        server.reset_all() - see _build_fixture()'s docstring for why.
         """
-        self.server.reset_all()
+        self._build_fixture()
         self.command = None
         self.terminated = False
         self._initialized = False
