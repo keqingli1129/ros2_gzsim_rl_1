@@ -25,6 +25,8 @@ from gz.msgs10.entity_pb2 import Entity
 from gz.msgs10.pose_v_pb2 import Pose_V
 from gz.msgs10.world_control_pb2 import WorldControl
 from gz.msgs10.boolean_pb2 import Boolean
+from gz.msgs10.empty_pb2 import Empty
+from gz.msgs10.serialized_map_pb2 import SerializedStepMap
 
 file_path = os.path.dirname(os.path.realpath(__file__))
 
@@ -237,6 +239,31 @@ def _gz_component_hash(type_name):
 
 _NAME_COMPONENT_ID = _gz_component_hash("gz_sim_components.Name")
 _POSE_COMPONENT_ID = _gz_component_hash("gz_sim_components.Pose")
+
+def _query_world_state(node):
+    """Synchronously fetch the full ECS snapshot from /world/cart_pole/state.
+
+    Unlike the dynamic_pose/info topic (published on a fixed ~17ms timer by
+    the SceneBroadcaster plugin, independent of when we actually need an
+    observation), this is a request/response service we can call whenever we
+    want a fresh reading - so the caller's own loop cadence becomes the
+    observation rate, not the publisher's.
+    """
+    ok, resp = node.request(
+        "/world/cart_pole/state", Empty(), Empty, SerializedStepMap, 2000)
+    if not ok:
+        return None, {}, {}
+
+    sim_time = resp.stats.sim_time.sec + resp.stats.sim_time.nsec * 1e-9
+    names_by_id = {}
+    pose_text_by_id = {}
+    for entity_id, entity_map in resp.state.entities.items():
+        for comp_id, comp in entity_map.components.items():
+            if comp_id == _NAME_COMPONENT_ID:
+                names_by_id[entity_id] = comp.component.decode("utf-8")
+            elif comp_id == _POSE_COMPONENT_ID:
+                pose_text_by_id[entity_id] = comp.component.decode("utf-8")
+    return sim_time, names_by_id, pose_text_by_id
 
 def pose_cb(msg):
     """Subscribe to pose updates to read cart and pole state.
