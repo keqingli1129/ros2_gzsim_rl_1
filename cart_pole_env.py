@@ -20,7 +20,6 @@ from gz.transport13 import Node
 from gz.msgs10.entity_wrench_pb2 import EntityWrench
 from gz.msgs10.wrench_pb2 import Wrench
 from gz.msgs10.vector3d_pb2 import Vector3d as Vector3dMsg
-from gz.msgs10.entity_pb2 import Entity
 from gz.msgs10.world_control_pb2 import WorldControl
 from gz.msgs10.boolean_pb2 import Boolean
 from gz.msgs10.empty_pb2 import Empty
@@ -51,6 +50,8 @@ class GzRewardScorer:
         self._initialized = False
         self.state = np.zeros(4, dtype=np.float32)
         self.reward = 0.0
+        self.prev_cart_pose = None
+        self.prev_pole_pose = None
 
     def _build_fixture(self):
         """
@@ -91,8 +92,6 @@ class GzRewardScorer:
         if info.paused:
             return
         self._ensure_initialized(ecm)
-        self.pole.enable_velocity_checks(ecm)
-        self.chassis.enable_velocity_checks(ecm)
         if self.command == 1:
             self.chassis.add_world_force(ecm, Vector3d(2000, 0, 0))
         elif self.command == 0:
@@ -107,11 +106,23 @@ class GzRewardScorer:
             return
         self._ensure_initialized(ecm)
         pole_pose = self.pole.world_pose(ecm).rot().euler().y()
-        ang_vel = self.pole.world_angular_velocity(ecm)
-        pole_angular_vel = ang_vel.y() if ang_vel is not None else 0.0
         cart_pose = self.chassis.world_pose(ecm).pos().x()
-        lin_vel = self.chassis.world_linear_velocity(ecm)
-        cart_vel = lin_vel.x() if lin_vel is not None else 0.0
+        # Estimate velocity via finite difference over the 5ms/5-tick step,
+        # matching run_inference()'s estimator exactly (average velocity
+        # over the step) rather than reading the physics engine's true
+        # instantaneous velocity - the out-of-process inference server has
+        # no way to get the latter over transport (enable_velocity_checks
+        # only works from in-process code with direct ECM access), so a
+        # policy trained on exact velocities sees a substantially different
+        # signal at inference (~76% relative error between the two, verified
+        # empirically) and its control quality degrades badly. Training on
+        # the same estimator the deployed policy will actually receive
+        # removes that train/inference distribution mismatch.
+        step_dt = 0.005  # 5 physics ticks x 1ms, deterministic in training
+        cart_vel = ((cart_pose - self.prev_cart_pose) / step_dt
+                    if self.prev_cart_pose is not None else 0.0)
+        pole_angular_vel = ((pole_pose - self.prev_pole_pose) / step_dt
+                             if self.prev_pole_pose is not None else 0.0)
         # Write the state to the environment
         self.state = np.array([cart_pose, cart_vel, pole_pose, pole_angular_vel], dtype=np.float32)
         if not self.terminated:
@@ -134,6 +145,8 @@ class GzRewardScorer:
         self.server.run(True, 5, paused)
         obs = self.state
         reward = self.reward
+        self.prev_cart_pose = obs[0]
+        self.prev_pole_pose = obs[2]
         return obs, reward, self.terminated, False, {}
 
     def reset(self):
@@ -145,6 +158,8 @@ class GzRewardScorer:
         self.command = None
         self.terminated = False
         self._initialized = False
+        self.prev_cart_pose = None
+        self.prev_pole_pose = None
         obs, reward_, term_, tunc_, other_= self.step(None, paused=False)
         return obs, {}
 
@@ -368,8 +383,28 @@ def run_inference(model):
 
         node = Node()
 
-        # Advertise on the wrench topic
-        wrench_pub = node.advertise("/world/cart_pole/wrench", EntityWrench)
+        # Advertise on the persistent wrench topic. The plain /wrench topic
+        # applies a queued force for exactly one PreUpdate (one 1ms physics
+        # step) then drops it (confirmed in gz-sim's ApplyLinkWrench source)
+        # - at our 5ms action cadence that's 1 tick of force out of every 5,
+        # roughly a fifth of training's authority (training's on_pre_update
+        # re-applies the same force every physics tick for all 5 ticks per
+        # action). /wrench/persistent keeps the force applied every tick,
+        # matching that.
+        #
+        # There's no working way to REMOVE a persistent entry in this gz-sim
+        # build: OnWrenchClear's entity match against the stored persistent
+        # entries never succeeds (verified directly - a wrench published to
+        # /wrench/clear, by bare or fully-scoped link name, leaves the prior
+        # persistent force fully in effect). What DOES work as documented is
+        # that persistent entries accumulate and their forces sum every tick
+        # (ApplyLinkWrench has no ISystemReset either, so this state also
+        # survives a world reset untouched). So instead of clearing, we track
+        # the net force we've applied so far in net_force_x and only ever
+        # publish the DELTA needed to move the running sum to the new target
+        # - e.g. to flip from a net +2000N to -2000N we publish -4000N, which
+        # added to the still-present +2000N entry nets to -2000N.
+        wrench_pub = node.advertise("/world/cart_pole/wrench/persistent", EntityWrench)
         time.sleep(1)
 
         entity_ids = _resolve_target_entities(node)
@@ -383,7 +418,9 @@ def run_inference(model):
         prev_cart_pose = None
         prev_pole_pose = None
         prev_sim_time = None
+        net_force_x = 0.0  # running sum of persistent force actually applied
         target_period = 0.005  # match training's 5ms (5 x 1ms) action cadence
+        episode_start = time.monotonic()
         for _ in range(50000):
             loop_start = time.monotonic()
             action, _s = model.predict(obs, deterministic=True)
@@ -393,14 +430,16 @@ def run_inference(model):
             # "vehicle_green::chassis") - this world's transport topics only
             # match against links' bare names, confirmed via the ECS state
             # query's Name components.
-            msg = EntityWrench()
-            msg.entity.name = "chassis"
-            msg.entity.type = 3  # LINK type
             force_x = 2000.0 if action == 1 else -2000.0
-            msg.wrench.force.x = force_x
-            msg.wrench.force.y = 0.0
-            msg.wrench.force.z = 0.0
-            wrench_pub.publish(msg)
+            if force_x != net_force_x:
+                msg = EntityWrench()
+                msg.entity.name = "chassis"
+                msg.entity.type = 3  # LINK type
+                msg.wrench.force.x = force_x - net_force_x  # delta, see note above
+                msg.wrench.force.y = 0.0
+                msg.wrench.force.z = 0.0
+                wrench_pub.publish(msg)
+                net_force_x = force_x
 
             sim_time, names_by_id, pose_text_by_id = _query_world_state(node)
             frame = _world_frame_pose(names_by_id, pose_text_by_id, entity_ids)
@@ -431,13 +470,27 @@ def run_inference(model):
             # applying force to an already-fallen/out-of-bounds cart forever.
             cart_pose, pole_pose = obs[0], obs[2]
             if pole_pose > 0.48 or pole_pose < -0.48 or cart_pose > 4.8 or cart_pose < -4.8:
-                print("Cart-pole out of bounds, resetting world...")
+                episode_len = time.monotonic() - episode_start
+                print(f"Cart-pole out of bounds after {episode_len:.2f}s, resetting world...")
+                # Persistent wrenches survive a world reset (ApplyLinkWrench
+                # has no ISystemReset), so zero the net force here too via a
+                # delta - otherwise the pre-reset force keeps being applied
+                # on the fresh episode instead of starting unforced like
+                # training's reset() (command=None) does.
+                if net_force_x != 0.0:
+                    zero_msg = EntityWrench()
+                    zero_msg.entity.name = "chassis"
+                    zero_msg.entity.type = 3  # LINK type
+                    zero_msg.wrench.force.x = -net_force_x
+                    wrench_pub.publish(zero_msg)
+                    net_force_x = 0.0
                 _reset_world(node)
                 time.sleep(0.5)  # let the reset propagate before next query
                 obs = np.zeros(4, dtype=np.float32)
                 prev_cart_pose = None
                 prev_pole_pose = None
                 prev_sim_time = None
+                episode_start = time.monotonic()
 
             elapsed = time.monotonic() - loop_start
             remaining = target_period - elapsed
