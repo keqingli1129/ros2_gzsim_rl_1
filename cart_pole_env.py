@@ -214,6 +214,30 @@ def _pitch_from_quat(q):
     sinp = max(-1.0, min(1.0, sinp))
     return math.asin(sinp)
 
+def _gz_component_hash(type_name):
+    """Replicate gz::common::hash64() (FNV-1a, 64-bit), used by gz-sim's
+    component Factory (components/Factory.hh) to assign each registered
+    component type a runtime ComponentTypeId. SerializedComponent.type on
+    the /world/<world>/state service carries this same value, so decoding
+    that service's response requires reproducing the hash here rather than
+    hardcoding IDs (they're derived from the type name string, not stable
+    across gz-sim versions/builds otherwise).
+    """
+    prime = 0x100000001b3
+    h = 0xcbf29ce484222325
+    mask = (1 << 64) - 1
+    for byte in type_name.encode("utf-8"):
+        h ^= byte
+        h = (h * prime) & mask
+    if h >= (1 << 63):
+        # SerializedComponent.type is a signed int64 field on the wire;
+        # values with the high bit set decode as negative.
+        h -= (1 << 64)
+    return h
+
+_NAME_COMPONENT_ID = _gz_component_hash("gz_sim_components.Name")
+_POSE_COMPONENT_ID = _gz_component_hash("gz_sim_components.Pose")
+
 def pose_cb(msg):
     """Subscribe to pose updates to read cart and pole state.
 
