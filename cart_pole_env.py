@@ -265,6 +265,65 @@ def _query_world_state(node):
                 pose_text_by_id[entity_id] = comp.component.decode("utf-8")
     return sim_time, names_by_id, pose_text_by_id
 
+def _euler_to_quat(roll, pitch, yaw):
+    """Convert roll/pitch/yaw (radians) to a (w, x, y, z) quaternion.
+
+    Mirrors gz::math::Quaternion<T>::SetFromEuler exactly (see
+    gz/math7/gz/math/Quaternion.hh) so composing poses decoded from the ECS
+    Pose component's Euler-angle text matches what Link.world_pose() would
+    have produced from the same underlying quaternion during training.
+    """
+    phi, the, psi = roll / 2.0, pitch / 2.0, yaw / 2.0
+    cphi, sphi = math.cos(phi), math.sin(phi)
+    cthe, sthe = math.cos(the), math.sin(the)
+    cpsi, spsi = math.cos(psi), math.sin(psi)
+    w = cphi * cthe * cpsi + sphi * sthe * spsi
+    x = sphi * cthe * cpsi - cphi * sthe * spsi
+    y = cphi * sthe * cpsi + sphi * cthe * spsi
+    z = cphi * cthe * spsi - sphi * sthe * cpsi
+    return (w, x, y, z)
+
+def _resolve_target_entities(node):
+    """Look up entity IDs for vehicle_green/chassis/pole by name, once.
+
+    Entity IDs are assigned at world-load time from the SDF and stay fixed
+    across a reset (confirmed live: same IDs before/after
+    WorldControl.reset.all=True), so this only needs to run once at
+    startup, not after every reset.
+    """
+    _, names_by_id, _ = _query_world_state(node)
+    wanted = {"vehicle_green", "chassis", "pole"}
+    ids = {name: eid for eid, name in names_by_id.items() if name in wanted}
+    missing = wanted - ids.keys()
+    if missing:
+        raise RuntimeError(f"Could not resolve entities: {missing}")
+    return ids
+
+def _parse_pose_text(text):
+    x, y, z, roll, pitch, yaw = (float(v) for v in text.split())
+    return (x, y, z), _euler_to_quat(roll, pitch, yaw)
+
+
+def _world_frame_pose(names_by_id, pose_text_by_id, entity_ids):
+    """Compose (cart_pose, pole_pose) in world frame from one state query.
+
+    Returns None if any of the three tracked entities' pose text is
+    missing from this particular response (e.g. mid-reset).
+    """
+    try:
+        model_pos, model_quat = _parse_pose_text(
+            pose_text_by_id[entity_ids["vehicle_green"]])
+        chassis_local_pos, _ = _parse_pose_text(
+            pose_text_by_id[entity_ids["chassis"]])
+        _, pole_local_quat = _parse_pose_text(
+            pose_text_by_id[entity_ids["pole"]])
+    except KeyError:
+        return None
+
+    cart_pose = model_pos[0] + _quat_rotate(model_quat, chassis_local_pos)[0]
+    pole_pose = _pitch_from_quat(_quat_mult(model_quat, pole_local_quat))
+    return cart_pose, pole_pose
+
 def pose_cb(msg):
     """Subscribe to pose updates to read cart and pole state.
 
