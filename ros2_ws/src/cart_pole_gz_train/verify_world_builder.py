@@ -1,13 +1,14 @@
 import os
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
-from world_builder import run_xacro, convert_urdf_to_sdf
+from world_builder import generate_training_world
 
 scratch_dir = os.path.dirname(__file__)
-urdf = run_xacro()
-assert "<robot" in urdf, "xacro did not produce a URDF"
-model_sdf = convert_urdf_to_sdf(urdf, scratch_dir)
-assert "cart_joint" in model_sdf and "pole_joint" in model_sdf, \
-    "converted SDF is missing expected joints"
-os.remove(os.path.join(scratch_dir, "_generated.urdf"))
-print("PASS: xacro -> SDF conversion produced cart_joint and pole_joint")
+output_path = os.path.join(scratch_dir, "cart_pole_train.sdf")
+world_text = generate_training_world(output_path)
+
+assert "<mesh>" not in world_text, "primitive replacement left a mesh behind"
+assert "tip_link" not in world_text, "tip_link should have been dropped"
+assert 'cart_joint' in world_text and 'pole_joint' in world_text
+assert '<world name="cart_pole_train">' in world_text
+print("PASS: generated world has no meshes, no tip_link, correct joints")
