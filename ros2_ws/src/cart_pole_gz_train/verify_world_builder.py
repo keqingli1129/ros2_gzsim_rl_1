@@ -11,4 +11,5 @@ assert "<mesh>" not in world_text, "primitive replacement left a mesh behind"
 assert "tip_link" not in world_text, "tip_link should have been dropped"
 assert 'cart_joint' in world_text and 'pole_joint' in world_text
 assert '<world name="cart_pole_train">' in world_text
-print("PASS: generated world has no meshes, no tip_link, correct joints")
+assert '<model name="cart_pole"><pose>0 0 2 0 0 0</pose>' in world_text, "pose-lift fix must be present in cart_pole model"
+print("PASS: generated world has no meshes, no tip_link, correct joints, and pose-lift fix")
