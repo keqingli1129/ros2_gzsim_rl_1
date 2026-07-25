@@ -1,0 +1,57 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+This covers the four packages inside `ros2_ws/src/`. For the workspace-level build quirk (venv `PATH` shadowing `catkin_pkg`) and how this workspace relates to the top-level `cart_pole/` project, see the root `CLAUDE.md`'s "ros2_ws" section — that context isn't repeated here.
+
+## Running
+
+Build first (from `ros2_ws/`, per the root CLAUDE.md), then source and launch:
+
+```bash
+source install/setup.bash
+ros2 launch robot_launch launch_simulation.launch.py
+```
+
+There are no unit tests in any of the four packages (no `test/` directories, despite `commander/setup.py` listing `tests_require=['pytest']`).
+
+## Packages and launch order
+
+`robot_launch` is the top-level package; its `launch_simulation.launch.py` wires the other three together in a specific dependency order, not just a flat list of nodes:
+
+1. Starts `gz_sim.launch.py` (from `ros_gz_sim`) against `robot_launch/worlds/robomaster_rale.world` — the world name `robomaster_rale` is hard-coded into `robot_control_launch.py`'s and `commander`'s topic/service names below, so renaming the world means updating those too.
+2. Runs `xacro` on `robot_description/robot/cart_pole.urdf.xacro` (via `Command(['xacro ', ...])`) to produce the `robot_description` launch argument, and publishes it through **two separate** `robot_state_publisher` nodes — one included from `robot_control`'s own launch file, one instantiated directly in `robot_launch`. Both exist because `robot_control_launch.py` was written to be includable standalone; `robot_launch` duplicates the node rather than relying on the include alone.
+3. Sets `GZ_SIM_RESOURCE_PATH` to the parent of `robot_description`'s share directory *before* spawning anything, because gz-sim resolves the URDF's `package://robot_description/meshes/...` URIs as `model://robot_description/meshes/...`, which is looked up relative to that env var, not the ROS package path.
+4. Spawns the model as `cart_pole` at `z=1.225` via `ros_gz_sim`'s `create` executable, reading the URDF off the `robot_description` topic.
+5. Starts `ros_gz_bridge`'s `parameter_bridge` with three bridged topics/services (see below).
+6. Only *after* the spawn node exits (`RegisterEventHandler(OnProcessExit(...))`) does it launch `commander` — the DQN node must not start publishing forces before the model exists in the world.
+
+### Bridge topic/service mapping (`robot_launch`)
+
+| Gazebo side | ROS side | Note |
+|---|---|---|
+| `/model/cart_pole/joint/cart_joint/cmd_force` | `/cart_controller/command` | `Float64` |
+| `/world/robomaster_rale/model/cart_pole/joint_state` | `/joint_states` | `JointState`; note the topic is nested under the **world** name, not the plain `/model/<model>/...` form the `JointStatePublisher`/`ApplyJointForce` docs describe — confirmed empirically via `gz topic -l`/`gz topic -i` against a running sim, for a model spawned into an already-running world |
+| `/world/robomaster_rale/control` | (same) | `ros_gz_interfaces/srv/ControlWorld`, used by `commander` to reset between episodes |
+
+### `robot_description`
+
+URDF/xacro + mesh (DAE for visuals, STL for collision) description of the cart-pole, built from four xacro macros (`base`, `cart`, `pole`, `tip`) chained as a `base_footprint → base_link → cart_link → pole_link → tip_link` joint tree in `robot/cart_pole.urdf.xacro`. The two gz-sim plugins that make the robot controllable/observable are declared directly in this top-level xacro file (not per-link):
+
+- `gz::sim::systems::ApplyJointForce` bound to `cart_joint` — the actuation path.
+- `gz::sim::systems::JointStatePublisher` — the state-feedback path (see the bridge table above for why its topic is world-namespaced).
+
+`cart_trans_v0` declares a `transmission_interface/SimpleTransmission` on `cart_joint`, but nothing in this workspace consumes `ros2_control` — it's vestigial from an earlier `ros2_control`-based design and has no effect on the gz-sim plugin path actually in use.
+
+### `robot_control`
+
+Single-purpose package: its launch file starts one parameterized `robot_state_publisher` node, taking `robot_description` as a launch argument rather than reading a file itself. Exists so `robot_launch` (or anything else) can bring up state publishing via one include rather than duplicating the node config — although `robot_launch` currently also stands up its own second `robot_state_publisher` instance alongside this include (see step 2 above).
+
+### `commander`
+
+`dqn_learning.py` is a from-scratch DQN (`QNet`/`Brain`/`Agent`), not Stable-Baselines3 (unlike the unrelated `cart_pole/` project at the repo root). `DQNSimulationNode`:
+
+- Reads cart position/velocity and pole angular velocity off `/joint_states` by name-matching `cart_joint`/`pole_joint` in the message, and integrates pole yaw angle itself from angular velocity (`yaw_angle += y_angular * time_interval`) — the joint state message carries no angle field for `pole_joint` directly usable here.
+- Publishes a scalar force to `/cart_controller/command`, computed from a discretized action index (`num_actions=10`) via `force = action * 16 / 9 - 8`, mapping the discrete action space onto a continuous force range.
+- Resets between episodes by calling `/world/robomaster_rale/control` with `reset.model_only = True`, deliberately **not** `reset.all` — confirmed via live testing that `reset.all` tears down and recreates every entity, which permanently stops `JointStatePublisher` from advertising its gz-transport topic after the first reset (silently freezing `/joint_states` for the rest of training). `model_only` resets poses/velocities without that teardown.
+- Runs training synchronously inside the main thread (`node.simulate(...)` in a loop up to `num_episodes=1000`), with `rclpy.spin` on a separate daemon thread purely to service the `/joint_states` subscription and the reset service client in the background.

@@ -40,3 +40,14 @@ Load-bearing details:
 - After `reset()`, entity handles are re-looked-up lazily via `_ensure_initialized` on the next update.
 - `/wrench/persistent` entries can't be cleared in this gz-sim build (`OnWrenchClear`'s entity match never succeeds) and survive a world reset untouched, so `run_inference` never clears — it tracks the net force already applied (`net_force_x`) and publishes only the delta needed to reach the new target force (including zeroing it before a reset).
 - `GzRewardScorer.reset()` rebuilds the `TestFixture`/server from scratch rather than calling `server.reset_all()` — the latter desyncs the physics engine from the ECM (force application and velocity reads silently stop working) while leaving entity IDs unchanged, so it isn't detectable as a stale-handle problem.
+
+## ros2_ws
+
+A separate, mostly-independent port of the same cart-pole concept onto the standard ROS 2 stack — a colcon workspace (ROS 2 Jazzy) with four packages under `ros2_ws/src/`: `robot_description` (URDF/xacro + STL/DAE meshes), `robot_control` (`robot_state_publisher` launch), `robot_launch` (top-level launch: spawns Gazebo, the `ros_gz_bridge`, and the robot), and `commander` (a from-scratch PyTorch DQN node, `dqn_learning.py`). It uses `ros2_control`-adjacent Gazebo plugins (`ApplyJointForce`, `JointStatePublisher`) and ROS 2 topics/services rather than `cart_pole/`'s direct `gz.sim8`/`gz.transport13` calls — the two are unrelated code paths that happen to model the same robot, not a shared implementation.
+
+**Building this workspace requires the opposite Python environment from `cart_pole/`:** `colcon build` must run with this repo's `.venv` **not** shadowing `python3` — ROS Jazzy's `ament_cmake` package processing needs `catkin_pkg`, which lives in system dist-packages, not the isolated venv. If `.venv/bin` is ahead of it on `PATH` (e.g. the venv is active), CMake picks up the venv's `python3`, `catkin_pkg` import fails, and the build errors out (also make sure to `rm -rf build install log` first if a prior attempt already ran under the wrong interpreter, since CMake caches the interpreter path). Build with:
+
+```bash
+cd ros2_ws
+PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '\.venv' | paste -sd:) VIRTUAL_ENV= colcon build --symlink-install
+```
