@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A cart-pole reinforcement-learning demo built directly on the Gazebo Sim (gz-sim 8 / Harmonic) Python API, trained with Stable Baselines3 PPO. Despite the repo name, no ROS 2 APIs are used — the sim is driven through `gz.sim8` bindings and `gz.transport13` topics. The project lives in `cart_pole/` — one script, `cart_pole/cart_pole_env.py`, plus the world definition `cart_pole/cart_pole.sdf` — under a repo root shared across environments (single `.venv`, `pyproject.toml`, `uv.lock`). Other envs (e.g. a future bipedal one) are expected to live in sibling top-level folders following the same self-contained layout.
+A cart-pole reinforcement-learning demo built directly on the Gazebo Sim (gz-sim 8 / Harmonic) Python API, trained with Stable Baselines3 PPO. Despite the repo name, no ROS 2 APIs are used — the sim is driven through `gz.sim8` bindings and `gz.transport13` topics. The project lives in `cart_pole_gz_sim/` — one script, `cart_pole_gz_sim/cart_pole_env.py`, plus the world definition `cart_pole_gz_sim/cart_pole.sdf` — under a repo root shared across environments (single `.venv`, `pyproject.toml`, `uv.lock`). Other envs (e.g. a future bipedal one) are expected to live in sibling top-level folders following the same self-contained layout.
 
 ## Environment & Running
 
@@ -16,7 +16,7 @@ Dependencies are split across two places, and both are required:
 So running the script requires exposing the system bindings to the venv:
 
 ```bash
-PYTHONPATH=/usr/lib/python3/dist-packages uv run cart_pole/cart_pole_env.py
+PYTHONPATH=/usr/lib/python3/dist-packages uv run cart_pole_gz_sim/cart_pole_env.py
 ```
 
 Importing the script has side effects: it immediately trains PPO for 100,000 timesteps (headless), saves `cart_pole_ppo.zip`, then launches a Gazebo server + GUI and runs inference until Ctrl+C. Pass `--infer-only` to skip training and load the saved `cart_pole_ppo.zip` straight into `run_inference`. There are no tests or linters configured — verification for changes to the inference path is done with scratch scripts run against a live `gz sim` server, not pytest.
