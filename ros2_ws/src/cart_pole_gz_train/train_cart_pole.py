@@ -5,6 +5,7 @@ ctypes.CDLL("/usr/lib/x86_64-linux-gnu/libgz-sim8.so", ctypes.RTLD_GLOBAL)
 import gymnasium as gym
 import numpy as np
 from stable_baselines3 import PPO
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from gz_scorer import GzCartPoleScorer, CART_POSITION_LIMIT, POLE_PITCH_LIMIT
@@ -48,7 +49,13 @@ def main():
     # gradient and the position dimensions are effectively drowned out.
     # VecNormalize (running mean/std normalization of observations) fixes
     # this without touching the reward function or termination logic.
-    venv = DummyVecEnv([lambda: CustomCartPoleGzTrain()])
+    #
+    # The Monitor wrapper is applied explicitly: SB3 only auto-wraps Monitor
+    # when the env handed to PPO() is *not* already a VecEnv, so passing a
+    # pre-built DummyVecEnv (which VecNormalize requires) silently drops
+    # episode bookkeeping and the rollout/ep_rew_mean and ep_len_mean rows
+    # vanish from the training log entirely - i.e. no visible learning curve.
+    venv = DummyVecEnv([lambda: Monitor(CustomCartPoleGzTrain())])
     venv = VecNormalize(venv, norm_obs=True, norm_reward=False, clip_obs=10.0)
     model = PPO("MlpPolicy", venv, verbose=1, device="auto")
     model.learn(total_timesteps=100_000)
