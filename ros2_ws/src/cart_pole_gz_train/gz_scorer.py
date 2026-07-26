@@ -27,10 +27,10 @@ POLE_PITCH_LIMIT = 0.48
 _world_generated_this_process = False
 
 
-def ensure_world_generated(force: bool = False) -> str:
+def ensure_world_generated() -> str:
     """Generate the training world SDF once per process, and return its path."""
     global _world_generated_this_process
-    if force or not _world_generated_this_process:
+    if not _world_generated_this_process:
         generate_training_world(SDF_PATH)
         _world_generated_this_process = True
     return SDF_PATH
