@@ -74,11 +74,16 @@ def run_trained(n_episodes, model_path, vecnorm_path):
             obs, _reward, done_arr, info = venv.step(action)
             done = bool(done_arr[0])
             steps += 1
-        # DummyVecEnv stores the true pre-reset obs in info on episode end
-        # (VecNormalize doesn't touch it, so it's raw/un-normalized) -
-        # fall back to the (already-reset) obs if unavailable.
+        # DummyVecEnv stores the true pre-reset obs in info on episode end.
+        # VecNormalize normalizes this if loaded, so we unnormalize it back to
+        # raw units for threshold comparison. Fall back to the (already-reset) obs
+        # if terminal_observation is unavailable.
         final_obs = info[0].get("terminal_observation", obs[0])
-        causes.append(_termination_cause(np.asarray(final_obs)))
+        final_obs = np.asarray(final_obs)
+        # If VecNormalize is loaded, unnormalize the terminal observation
+        if isinstance(venv, VecNormalize):
+            final_obs = venv.unnormalize_obs(final_obs)
+        causes.append(_termination_cause(final_obs))
         lengths.append(steps)
         print(f"  episode {ep + 1}: {steps} steps (terminated on {causes[-1]})")
     venv.close()
