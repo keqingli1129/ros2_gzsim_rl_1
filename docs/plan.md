@@ -722,6 +722,360 @@ git commit -m "feat(cart_pole_gz_train): add PPO training entrypoint"
 
 ---
 
+### Task 6: Verify `reset.model_only` preserves `JointStatePublisher`'s topic
+
+**Files:**
+- Create: `ros2_ws/src/cart_pole_gz_train/verify_reset_preserves_joint_state.py` (scratch script, not pytest)
+
+**Interfaces:**
+- Consumes: `generate_training_world` from `world_builder.py` (Tasks 1-2)
+
+This task exists to check a specific risk before Task 7 depends on it: `ros2_ws/src/CLAUDE.md`'s `commander` notes document that `WorldControl.reset.all = True` permanently stops `JointStatePublisher` from advertising its gz-transport topic after the first reset (entities get torn down and recreated). That finding was against a different world (a model dynamically spawned via `ros_gz_sim`'s `create`, under `ros_gz_bridge`) — this task confirms `reset.model_only = True` avoids the same failure against *this* world (declared whole in the generated `cart_pole_train.sdf`, loaded directly by `gz sim -s -r`, no dynamic spawn).
+
+The following was already confirmed live (via `gz topic -l`/`-i`/`-e` against a running `cart_pole_train.sdf` server) and can be taken as given: the server exposes `/model/cart_pole/joint/cart_joint/cmd_force` (`gz.msgs.Double`, subscribed by `ApplyJointForce`), `/world/cart_pole_train/model/cart_pole/joint_state` (`gz.msgs.Model`, published by `JointStatePublisher`, each `joint` entry has `name` and `axis1.position`/`axis1.velocity`), and `/world/cart_pole_train/control` (`gz.msgs.WorldControl` → `gz.msgs.Boolean`). `gz.transport13`/`gz.msgs10` import fine without the `ctypes.CDLL(".../libgz-sim8.so", ...)` preload (confirmed empirically) — that preload is specifically for `gz.sim8`'s `TestFixture`/ECM bindings, which this script never touches.
+
+- [ ] **Step 1: Write the verification script**
+
+```python
+import os
+import sys
+import subprocess
+import time
+
+FILE_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, FILE_DIR)
+
+from world_builder import generate_training_world
+
+from gz.transport13 import Node
+from gz.msgs10.model_pb2 import Model
+from gz.msgs10.world_control_pb2 import WorldControl
+from gz.msgs10.boolean_pb2 import Boolean
+
+sdf_path = os.path.join(FILE_DIR, "cart_pole_train.sdf")
+generate_training_world(sdf_path)
+
+gz_server = subprocess.Popen(["gz", "sim", "-s", "-r", sdf_path])
+try:
+    time.sleep(4)  # let the server come up and start publishing
+
+    node = Node()
+    counts = {"before": 0, "after": 0}
+    phase = {"value": "before"}
+
+    def on_joint_state(_msg):
+        counts[phase["value"]] += 1
+
+    node.subscribe(
+        Model, "/world/cart_pole_train/model/cart_pole/joint_state",
+        on_joint_state)
+
+    time.sleep(2)
+    assert counts["before"] > 0, (
+        "no joint_state messages received before reset - is the server up "
+        "and is JointStatePublisher declared in the generated SDF?"
+    )
+
+    request = WorldControl()
+    request.reset.model_only = True
+    ok, _resp = node.request(
+        "/world/cart_pole_train/control", request, WorldControl, Boolean, 5000)
+    assert ok, "reset.model_only request failed"
+
+    phase["value"] = "after"
+    time.sleep(2)
+
+    assert counts["after"] > 0, (
+        f"JointStatePublisher stopped publishing after reset.model_only=True "
+        f"(before={counts['before']} msgs, after={counts['after']} msgs) - "
+        f"the same bug ros2_ws/src/CLAUDE.md documents for reset.all in the "
+        f"commander package. run_inference.py (Task 7) would need a "
+        f"different reset strategy (e.g. re-subscribing after reset, or "
+        f"driving joints back via set_pose_vector instead of "
+        f"WorldControl.reset) - do not proceed to Task 7 until this is "
+        f"resolved."
+    )
+    print(
+        f"PASS: joint_state kept publishing after reset.model_only=True "
+        f"(before={counts['before']} msgs, after={counts['after']} msgs)"
+    )
+finally:
+    gz_server.terminate()
+    gz_server.wait(timeout=10)
+```
+
+- [ ] **Step 2: Run it**
+
+```bash
+PYTHONPATH=/usr/lib/python3/dist-packages uv run ros2_ws/src/cart_pole_gz_train/verify_reset_preserves_joint_state.py
+```
+Expected: `PASS: joint_state kept publishing after reset.model_only=True (before=... msgs, after=... msgs)`
+
+If it instead fails the `counts["after"] > 0` assertion, stop — Task 7 cannot use `WorldControl.reset` for episode resets as designed, and the reset strategy needs to be revisited before continuing (see the assertion message for alternatives to try).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add ros2_ws/src/cart_pole_gz_train/verify_reset_preserves_joint_state.py
+git commit -m "test(cart_pole_gz_train): verify reset.model_only keeps joint_state publishing"
+```
+
+---
+
+### Task 7: `run_inference.py` — live-GUI inference over Gazebo transport
+
+**Files:**
+- Create: `ros2_ws/src/cart_pole_gz_train/run_inference.py`
+
+**Interfaces:**
+- Consumes: `SDF_PATH`, `CART_POSITION_LIMIT`, `POLE_PITCH_LIMIT` from `gz_scorer.py` (Task 4); `generate_training_world` from `world_builder.py` (Tasks 1-2); `cart_pole_gz_train_ppo.zip`/`vecnormalize.pkl` produced by `train_cart_pole.py` (Task 5); the transport interface and `reset.model_only` behavior confirmed by Task 6.
+- Produces: `run_inference.py`, runnable the same way as the trainer: `PYTHONPATH=/usr/lib/python3/dist-packages uv run ros2_ws/src/cart_pole_gz_train/run_inference.py`.
+
+This is the joint-based, `ros2_ws` analogue of `cart_pole/cart_pole_env.py`'s `run_inference()` — simpler in three ways because this robot has real joints instead of a bare chassis link: true physics velocity is available directly (no finite-difference estimator), `ApplyJointForce`'s `cmd_force` just holds its last value (no persistent-wrench delta/net-force bookkeeping), and joint state arrives via a plain pub/sub topic (no FNV-hashed ECS-state decoding).
+
+- [ ] **Step 1: Write `run_inference.py`**
+
+```python
+import argparse
+import os
+import sys
+import ctypes
+ctypes.CDLL("/usr/lib/x86_64-linux-gnu/libgz-sim8.so", ctypes.RTLD_GLOBAL)
+
+import subprocess
+import time
+import xml.etree.ElementTree as ET
+
+import gymnasium as gym
+import numpy as np
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+FILE_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, FILE_DIR)
+
+from world_builder import generate_training_world
+from gz_scorer import SDF_PATH, CART_POSITION_LIMIT, POLE_PITCH_LIMIT
+
+from gz.transport13 import Node
+from gz.msgs10.double_pb2 import Double
+from gz.msgs10.model_pb2 import Model
+from gz.msgs10.world_control_pb2 import WorldControl
+from gz.msgs10.boolean_pb2 import Boolean
+
+WORLD_NAME = "cart_pole_train"
+MODEL_NAME = "cart_pole"
+STEP_PERIOD = 0.005  # matches training's 5 x 1ms action cadence
+MAX_ITERATIONS = 50000  # ~250s, mirrors cart_pole_env.py's run_inference bound
+
+
+class _ObsSpaceStub(gym.Env):
+    """Carries only the observation/action space VecNormalize.load needs to
+    shape-check against - never calls into gz, so constructing it can't
+    double-register on the training world's transport name alongside the
+    live inference server (unlike instantiating CustomCartPoleGzTrain,
+    whose __init__ builds a real GzCartPoleScorer)."""
+
+    def __init__(self):
+        self.action_space = gym.spaces.Discrete(2)
+        self.observation_space = gym.spaces.Box(
+            np.array([-CART_POSITION_LIMIT, -np.inf, -POLE_PITCH_LIMIT, -np.inf], dtype=np.float32),
+            np.array([CART_POSITION_LIMIT, np.inf, POLE_PITCH_LIMIT, np.inf], dtype=np.float32),
+            (4,), np.float32,
+        )
+
+    def reset(self, seed=None, options=None):
+        raise NotImplementedError("stub env is never actually reset/stepped")
+
+    def step(self, action):
+        raise NotImplementedError("stub env is never actually reset/stepped")
+
+
+def _load_normalizer(vecnorm_path):
+    if not os.path.exists(vecnorm_path):
+        raise SystemExit(
+            f"ERROR: VecNormalize stats not found at {vecnorm_path!r}.\n"
+            "The trained policy expects observations normalized with the "
+            "running statistics saved during training; running inference "
+            "without them silently reproduces random-baseline performance. "
+            "Re-run train_cart_pole.py (which writes vecnormalize.pkl next "
+            "to the model) or pass --vecnorm explicitly."
+        )
+    venv = DummyVecEnv([lambda: _ObsSpaceStub()])
+    venv = VecNormalize.load(vecnorm_path, venv)
+    venv.training = False
+    venv.norm_reward = False
+    return venv
+
+
+def _read_effort_limit(sdf_path, joint_name):
+    root = ET.parse(sdf_path).getroot()
+    effort_el = root.find(f".//joint[@name='{joint_name}']/axis/limit/effort")
+    if effort_el is None:
+        raise RuntimeError(
+            f"could not find an effort limit for joint {joint_name!r} in "
+            f"{sdf_path} - did the xacro or gz sdf conversion change its "
+            f"structure?"
+        )
+    return float(effort_el.text)
+
+
+def _kill_stale_gz_processes():
+    """Terminate any gz sim server/GUI left over from a prior run - a
+    leftover server registers on the same transport bus under the same
+    world name as the one about to be launched, and the new GUI can attach
+    to that stale instance instead of ours."""
+    subprocess.run(["pkill", "-f", "gz sim"], check=False)
+    time.sleep(1)
+
+
+def _reset_world(node):
+    """Reset via reset.model_only, not reset.all - see Task 6's
+    verify_reset_preserves_joint_state.py: reset.all tears down and
+    recreates entities, which permanently stops JointStatePublisher from
+    advertising its topic after the first reset. model_only resets
+    poses/velocities without that teardown."""
+    request = WorldControl()
+    request.reset.model_only = True
+    ok, _resp = node.request(
+        f"/world/{WORLD_NAME}/control", request, WorldControl, Boolean, 5000)
+    if not ok:
+        raise RuntimeError("world reset request failed")
+
+
+def _wait_for_obs(latest, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if latest["obs"] is not None:
+            return
+        time.sleep(0.01)
+    raise RuntimeError(
+        "no joint_state message received - is JointStatePublisher declared "
+        "in the generated SDF?"
+    )
+
+
+def run_inference(model, normalizer, effort_limit):
+    _kill_stale_gz_processes()
+
+    gz_server = None
+    gz_gui = None
+    try:
+        print("Launching Gazebo server...")
+        gz_server = subprocess.Popen(["gz", "sim", "-s", "-r", SDF_PATH])
+        time.sleep(3)
+
+        print("Launching Gazebo GUI...")
+        gz_gui = subprocess.Popen(["gz", "sim", "-g"])
+        time.sleep(5)  # wait for GUI to connect
+
+        node = Node()
+        force_pub = node.advertise(
+            f"/model/{MODEL_NAME}/joint/cart_joint/cmd_force", Double)
+
+        latest = {"obs": None}
+
+        def on_joint_state(msg):
+            positions = {j.name: j.axis1.position for j in msg.joint}
+            velocities = {j.name: j.axis1.velocity for j in msg.joint}
+            try:
+                obs = np.array([
+                    positions["cart_joint"], velocities["cart_joint"],
+                    positions["pole_joint"], velocities["pole_joint"],
+                ], dtype=np.float32)
+            except KeyError:
+                return  # mid-reset snapshot missing a joint; skip it
+            latest["obs"] = obs
+
+        node.subscribe(
+            Model, f"/world/{WORLD_NAME}/model/{MODEL_NAME}/joint_state",
+            on_joint_state)
+
+        print("Waiting for first joint_state message...")
+        _wait_for_obs(latest)
+
+        print("Running inference with GUI... Press Ctrl+C to stop.")
+        episode_start = time.monotonic()
+        for _ in range(MAX_ITERATIONS):
+            loop_start = time.monotonic()
+
+            obs = latest["obs"]
+            normalized = normalizer.normalize_obs(obs.reshape(1, -1))
+            action, _state = model.predict(normalized, deterministic=True)
+            action = int(action[0])
+
+            force_msg = Double()
+            force_msg.data = effort_limit if action == 1 else -effort_limit
+            force_pub.publish(force_msg)
+
+            cart_pos, _cart_vel, pole_pos, _pole_vel = obs
+            if abs(cart_pos) > CART_POSITION_LIMIT or abs(pole_pos) > POLE_PITCH_LIMIT:
+                episode_len = time.monotonic() - episode_start
+                print(f"Cart-pole out of bounds after {episode_len:.2f}s, resetting world...")
+                _reset_world(node)
+                latest["obs"] = None
+                time.sleep(0.5)  # let the reset propagate before next read
+                _wait_for_obs(latest)
+                episode_start = time.monotonic()
+
+            elapsed = time.monotonic() - loop_start
+            remaining = STEP_PERIOD - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        for proc in (gz_gui, gz_server):
+            if proc is not None:
+                proc.terminate()
+        for proc in (gz_gui, gz_server):
+            if proc is not None:
+                proc.wait()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model", default=os.path.join(FILE_DIR, "cart_pole_gz_train_ppo"))
+    parser.add_argument(
+        "--vecnorm", default=os.path.join(FILE_DIR, "vecnormalize.pkl"))
+    args = parser.parse_args()
+
+    generate_training_world(SDF_PATH)
+    effort_limit = _read_effort_limit(SDF_PATH, "cart_joint")
+    print(f"Read cart_joint effort limit from generated SDF: {effort_limit}N")
+
+    model = PPO.load(args.model)
+    print(f"Loaded model from {args.model}.zip")
+    normalizer = _load_normalizer(args.vecnorm)
+    print(f"Loaded VecNormalize stats from {args.vecnorm}")
+
+    run_inference(model, normalizer, effort_limit)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 2: Run it and watch the GUI**
+
+```bash
+PYTHONPATH=/usr/lib/python3/dist-packages uv run ros2_ws/src/cart_pole_gz_train/run_inference.py
+```
+Expected console output: `Read cart_joint effort limit from generated SDF: 30.0N`, `Loaded model from .../cart_pole_gz_train_ppo.zip`, `Loaded VecNormalize stats from .../vecnormalize.pkl`, `Launching Gazebo server...`, `Launching Gazebo GUI...`, `Waiting for first joint_state message...`, `Running inference with GUI... Press Ctrl+C to stop.`
+
+In the GUI window: the cart-pole should visibly balance (small, roughly-symmetric back-and-forth cart motion, pole staying near-vertical), matching the deterministic policy's training-time behavior (Task 5's amendment: ≥2000 steps/episode, never falling). If the pole falls over, the console should print `Cart-pole out of bounds after ...s, resetting world...` and the model should visibly reset to its upright starting pose and keep balancing — confirming Task 6's `reset.model_only` finding holds inside the full script too. Let it run for at least 15-20 seconds, then press Ctrl+C; expect `Stopping...` and a clean exit with no leftover `gz sim` processes (check with `ps aux | grep "gz sim"` — matching against just the substring `gz sim`, not the literal command run in this check, so the check itself never self-matches).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add ros2_ws/src/cart_pole_gz_train/run_inference.py
+git commit -m "feat(cart_pole_gz_train): add live-GUI inference over Gazebo transport"
+```
+
+---
+
 ## Notes for the implementer
 
 - ~~`cart_pole_train.sdf` is regenerated by `GzCartPoleScorer._build_fixture()` only if it doesn't already exist at `SDF_PATH` — delete it manually to force regeneration after editing the xacro.~~ **Amended:** existence-gating meant a leftover file from any previous process (possibly a different checkout) was silently reused forever, contradicting the PRD's "no silent fallback to a stale cached SDF". `gz_scorer.ensure_world_generated()` now regenerates it exactly once per process, from `GzCartPoleScorer.__init__` — not on every `reset()` (thousands per run, and the world is fixed for a run's lifetime) and not conditional on the file existing.

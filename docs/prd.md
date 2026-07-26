@@ -12,9 +12,10 @@ A standalone training script under `ros2_ws/src/` that trains a policy for the r
 
 ## Out of scope
 
-- Out-of-process/GUI inference (mirroring `cart_pole_env.py`'s `run_inference`) — a natural follow-up, not built here.
 - Any change to `commander/dqn_learning.py` or the live ROS launch stack (`robot_launch`, `robot_control`, the `ros_gz_bridge` topic mapping) — untouched.
 - Installing SB3/gymnasium into system `dist-packages`, or otherwise making this buildable/runnable via `colcon`/`ros2 run`.
+
+> **Amendment (follow-up feature):** out-of-process/GUI inference, originally listed above as a deferred follow-up, is now in scope — see Requirement 8 and `docs/plan.md`'s Task 6.
 
 ## Requirements
 
@@ -38,7 +39,9 @@ A standalone training script under `ros2_ws/src/` that trains a policy for the r
 
 7. **Output**: saved policy `cart_pole_gz_train_ppo.zip`, written into `ros2_ws/src/cart_pole_gz_train/` alongside the script and the generated SDF.
 
-8. **Testing**: no pytest, matching this repo's existing convention in both `cart_pole/` and `ros2_ws/`. Verification is a scratch script that steps the env a handful of times and prints applied force vs. resulting `cart_joint` velocity change, confirming the force→dynamics link works before committing to a full training run. Training success is judged by episode reward trending upward.
+8. **Live GUI inference.** A standalone `run_inference.py`, mirroring `cart_pole_env.py`'s `run_inference()`: spawn `gz sim -s -r`/`-g` against the generated training world and drive the saved policy over Gazebo transport (not `TestFixture`) until Ctrl+C. Because this robot has real joints, the transport interface is simpler than the root project's wrench-based one — command `cart_joint` via the `ApplyJointForce` plugin's `/model/cart_pole/joint/cart_joint/cmd_force` topic (`gz.msgs.Double`, holds its last value with no clear/decay bug, unlike `/wrench/persistent`) and read true joint position/velocity (no finite-difference estimation needed) off the `JointStatePublisher` plugin's `/world/cart_pole_train/model/cart_pole/joint_state` topic (`gz.msgs.Model`, `joint[].axis1.position`/`.velocity`, keyed by joint name) via plain pub/sub, rather than the root project's synchronous FNV-hashed ECS-state decoding. Observations must be normalized with the same `VecNormalize` statistics (`vecnormalize.pkl`) used in training before calling `model.predict` — done via a `gym.Env` stub carrying only the right `observation_space`/`action_space` (no `gz` calls), wrapped in `DummyVecEnv` + `VecNormalize.load(...)`, calling `.normalize_obs()` as a pure array op so a second live `GzCartPoleScorer` never double-registers on the training world's transport name. Cart-joint force magnitude is parsed from the generated `cart_pole_train.sdf`'s `<limit><effort>` rather than hardcoded. Episode reset on falling (`|cart_pos| > CART_POSITION_LIMIT` or `|pole_pos| > POLE_PITCH_LIMIT`, imported from `gz_scorer.py`) uses `WorldControl.reset.model_only = True` on `/world/cart_pole_train/control` — **not** `reset.all`, which `ros2_ws/src/commander`'s notes document as permanently killing `JointStatePublisher`'s topic advertisement after the first reset.
+
+9. **Testing**: no pytest, matching this repo's existing convention in both `cart_pole/` and `ros2_ws/`. Verification is a scratch script that steps the env a handful of times and prints applied force vs. resulting `cart_joint` velocity change, confirming the force→dynamics link works before committing to a full training run. Training success is judged by episode reward trending upward.
 
 ## Key trade-offs decided during design
 
