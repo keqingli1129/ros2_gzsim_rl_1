@@ -10,6 +10,14 @@ _PRIMITIVE_GEOMETRY = {
     "cart_link": ("box", "0.3 0.3 0.15"),
 }
 
+# Distinct per-link colors purely so run_inference.py's live GUI is legible
+# (headless training never renders, so these have zero effect there).
+_VISUAL_COLOR = {
+    "base_footprint": "0.25 0.25 0.3 1",
+    "cart_link": "0.85 0.45 0.05 1",
+    "pole_link": "0.75 0.1 0.1 1",
+}
+
 # The pole's collision cylinder. The real pole occupies pole_link-frame
 # z in [-1, 0] (the xacro puts tip_link at "0 0 -1" relative to pole_link
 # and the inertial CoM at z=-0.489554, i.e. the pole hangs off the -z side
@@ -69,12 +77,20 @@ def _set_collision_pose(collision: ET.Element, pose_text: str) -> None:
 
 
 def postprocess_model_sdf(model_sdf_text: str) -> str:
-    """Strip visuals and replace mesh collision with primitives sized to
-    roughly match the real robot_description meshes, and drop tip_link
+    """Strip mesh visuals and replace mesh collision with primitives sized
+    to roughly match the real robot_description meshes, and drop tip_link
     (mass 0.0001, physically negligible mount point) - keeps the physics
     parameters (mass/inertia/joint limits) sourced live from the xacro
     while collision shape stays hand-simplified, since headless training
-    never renders and shouldn't pay for mesh-based collision."""
+    never renders and shouldn't pay for mesh-based collision.
+
+    Each replaced collision primitive gets a matching <visual> added back
+    (same shape/size/pose) - training pays nothing extra for it (TestFixture
+    never renders), but run_inference.py's live GUI loads this exact same
+    generated world, and a model with collision geometry but zero <visual>
+    elements exists in the ECM/scene graph (confirmed live: the GUI's
+    Entity Tree correctly lists it) while rendering as a completely empty
+    viewport - there's nothing to draw."""
     root = ET.fromstring(model_sdf_text)
     model = root if root.tag == "model" else root.find("model")
 
@@ -88,15 +104,28 @@ def postprocess_model_sdf(model_sdf_text: str) -> str:
             if mesh is None:
                 continue
             geometry.remove(mesh)
+            visual = ET.SubElement(link, "visual", {"name": f"{name}_visual"})
+            vis_geometry = ET.SubElement(visual, "geometry")
             if name == "pole_link":
                 cylinder = ET.SubElement(geometry, "cylinder")
                 ET.SubElement(cylinder, "radius").text = str(_POLE_CYLINDER_RADIUS)
                 ET.SubElement(cylinder, "length").text = str(_POLE_CYLINDER_LENGTH)
                 _set_collision_pose(collision, _POLE_COLLISION_POSE)
+                vis_cylinder = ET.SubElement(vis_geometry, "cylinder")
+                ET.SubElement(vis_cylinder, "radius").text = str(_POLE_CYLINDER_RADIUS)
+                ET.SubElement(vis_cylinder, "length").text = str(_POLE_CYLINDER_LENGTH)
+                ET.SubElement(visual, "pose").text = _POLE_COLLISION_POSE
             else:
                 shape, size = _PRIMITIVE_GEOMETRY.get(name, ("box", "0.2 0.2 0.2"))
                 box = ET.SubElement(geometry, shape)
                 ET.SubElement(box, "size").text = size
+                vis_box = ET.SubElement(vis_geometry, shape)
+                ET.SubElement(vis_box, "size").text = size
+
+            color = _VISUAL_COLOR.get(name, "0.5 0.5 0.5 1")
+            material = ET.SubElement(visual, "material")
+            ET.SubElement(material, "ambient").text = color
+            ET.SubElement(material, "diffuse").text = color
 
     for joint in list(model.findall("joint")):
         if joint.get("name") == "tip_joint":
@@ -160,6 +189,31 @@ def wrap_in_world(model_sdf_text: str) -> str:
     <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"></plugin>
     <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"></plugin>
     <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"></plugin>
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+    <gui fullscreen="0">
+      <plugin name="3D View" filename="GzScene3D">
+        <gz-gui>
+          <title>3D View</title>
+          <property type="bool" key="showTitleBar">false</property>
+          <property type="string" key="state">docked</property>
+        </gz-gui>
+        <engine>ogre2</engine>
+        <scene>scene</scene>
+        <ambient_light>0.4 0.4 0.4</ambient_light>
+        <background_color>0.8 0.8 0.8</background_color>
+        <!-- Framed close to the robot's spawn point (origin, ~1.3m tall)
+             so run_inference.py's GUI opens already looking at it, instead
+             of the client's default far-away view. Purely cosmetic - has
+             no effect on headless training. -->
+        <camera_pose>-2 -2 1.4 0 0.15 0.785</camera_pose>
+      </plugin>
+    </gui>
     <model name="ground_plane">
       <static>true</static>
       <link name="link">
