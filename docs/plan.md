@@ -507,12 +507,40 @@ git commit -m "feat(cart_pole_gz_train): add GzCartPoleScorer with joint-based E
 
 ### Task 5: Gymnasium wrapper and PPO training entrypoint
 
+> **Amendment (post-implementation, human-approved):** the code below is the
+> plan as originally written — vanilla PPO with no observation normalization.
+> Building and training it exactly as written produced a policy that was
+> statistically indistinguishable from a random policy (verified empirically:
+> 15-episode random baseline mean 123.2/range 88-154 vs. the trained
+> deterministic policy's identical 118-step episode every time). Root cause,
+> confirmed by directly measuring raw observation magnitudes: `cart_vel` and
+> especially `pole_vel` (the pole link's low rotational inertia) run roughly
+> 10-30x larger in magnitude than `cart_pos`/`pole_pitch`, and SB3's PPO does
+> not normalize observations by default — a freshly-initialized `MlpPolicy`
+> expects roughly unit-scale inputs, so the velocity dimensions dominated the
+> learning signal. Fix: wrap the env in `DummyVecEnv` + `VecNormalize`
+> (`norm_obs=True`, `norm_reward=False` — reward is untouched, still the flat
+> 0/1 from Tasks 2/4) before constructing `PPO`, and persist the running
+> normalization statistics (`vecnormalize.pkl`) alongside the model, since any
+> code that later feeds this policy observations (evaluation, future
+> inference) must normalize them the same way or the fix silently reverts.
+> Retrained for the full 100,000 timesteps under this change: the resulting
+> deterministic policy now survives 453/453/453... steps across 15 evaluation
+> episodes, vs. a freshly-reproduced random baseline of mean 121.2 (range
+> 112-157) — see `.superpowers/sdd/task-5-tuning-report.md` for full
+> measurements, the causality-control run (same model, without the
+> normalization stats, collapses back to ~126 steps — random-baseline range),
+> and self-review. A companion scratch script, `evaluate_policy.py`, was added
+> to run this before/after comparison (random vs. trained episode-length,
+> matching the repo's no-pytest convention).
+
 **Files:**
 - Create: `ros2_ws/src/cart_pole_gz_train/train_cart_pole.py`
+- Create: `ros2_ws/src/cart_pole_gz_train/evaluate_policy.py` (scratch episode-length measurement script, added post-implementation)
 
 **Interfaces:**
 - Consumes: `GzCartPoleScorer` from Task 4 (`step`/`reset`/`close`, `CART_POSITION_LIMIT`, `POLE_PITCH_LIMIT`)
-- Produces: `CustomCartPoleGzTrain(gym.Env)`, `main()` — saves `cart_pole_gz_train_ppo.zip` in the same directory
+- Produces: `CustomCartPoleGzTrain(gym.Env)`, `main()` — saves `cart_pole_gz_train_ppo.zip` **and `vecnormalize.pkl`** in the same directory
 
 - [ ] **Step 1: Write `train_cart_pole.py`**
 
