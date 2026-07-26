@@ -128,13 +128,25 @@ def _reset_world(node):
     unrelated commander/robomaster_rale world documented in
     ros2_ws/src/CLAUDE.md, where reset.all's entity teardown permanently
     stops JointStatePublisher from advertising - that finding does not
-    generalize to this world/SDF)."""
+    generalize to this world/SDF).
+
+    This does not raise on ok=False. Direct measurement (both while
+    implementing this script and again while reviewing it) showed
+    node.request() can come back with ok=False - an RPC-level
+    timeout/lost acknowledgment, roughly 1-in-9 in testing - even though
+    the reset physically happened: position/velocity were confirmed at
+    ~0 immediately afterward despite the False. So the RPC's own ok flag
+    is not a trustworthy signal of whether the reset took effect in
+    either direction, and raising on it would abort a run that actually
+    succeeded. The caller checks the real postcondition instead (the
+    post-reset observation against CART_POSITION_LIMIT/POLE_PITCH_LIMIT)
+    once it has a fresh reading, and raises there if the reset truly
+    didn't take."""
     request = WorldControl()
     request.reset.all = True
     ok, _resp = node.request(
         f"/world/{WORLD_NAME}/control", request, WorldControl, Boolean, 5000)
-    if not ok:
-        raise RuntimeError("world reset request failed")
+    return ok
 
 
 def _wait_for_obs(latest, timeout=2.0):
@@ -213,11 +225,17 @@ def run_inference(model, normalizer, effort_limit):
                 # verify_reset_preserves_joint_state.py). Unsubscribe for
                 # the duration of the request, resubscribe once it returns.
                 node.unsubscribe(joint_state_topic)
-                _reset_world(node)
-                node.subscribe(Model, joint_state_topic, on_joint_state)
+                reset_ok = _reset_world(node)
                 latest["obs"] = None
+                node.subscribe(Model, joint_state_topic, on_joint_state)
                 time.sleep(0.5)  # let the reset propagate before next read
                 _wait_for_obs(latest)
+                cart_pos, _cart_vel, pole_pos, _pole_vel = latest["obs"]
+                if abs(cart_pos) > CART_POSITION_LIMIT or abs(pole_pos) > POLE_PITCH_LIMIT:
+                    raise RuntimeError(
+                        f"world reset did not take effect (request ok={reset_ok}, "
+                        f"post-reset cart={cart_pos:.4f} pole={pole_pos:.4f})"
+                    )
                 episode_start = time.monotonic()
 
             elapsed = time.monotonic() - loop_start

@@ -53,12 +53,17 @@ try:
     # confirms "a fresh subscription resumes receiving after reset" rather
     # than the plan's original, stronger claim that "an already-open
     # subscription keeps receiving through the reset." That narrower scope
-    # is intentional and sufficient here: Task 7's run_inference.py is
-    # designed to drive its own episode resets with this exact same
+    # is intentional and sufficient here: Task 7's run_inference.py drives
+    # its own episode resets with this exact same
     # unsubscribe-before-reset/resubscribe-after-reset pattern (see its
-    # main loop's call to _reset_world), so this script validates exactly
-    # the pattern production code will actually use, not a stand-in for a
-    # different one.
+    # main loop's call to _reset_world), so this script validates that
+    # pattern. Note reset.model_only itself (used below) was later found to
+    # be a complete no-op on this world - position/velocity never actually
+    # change - and was superseded by reset.all in the shipped
+    # run_inference.py (see its _reset_world docstring). This script's
+    # remaining value is validating the unsubscribe/resubscribe transport
+    # pattern against the request/subscription deadlock, which holds
+    # regardless of which reset type is issued.
     node.unsubscribe(TOPIC)
 
     request = WorldControl()
@@ -83,7 +88,11 @@ try:
     )
     print(
         f"PASS: joint_state kept publishing after reset.model_only=True "
-        f"(before={counts['before']} msgs, after={counts['after']} msgs)"
+        f"(before={counts['before']} msgs, after={counts['after']} msgs). "
+        f"Note: reset.model_only itself was later found to be a no-op on "
+        f"this world and is superseded by reset.all in run_inference.py - "
+        f"this result only validates the unsubscribe/resubscribe transport "
+        f"pattern, independent of which reset type is used."
     )
 finally:
     gz_server.terminate()
