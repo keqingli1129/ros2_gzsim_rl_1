@@ -29,6 +29,14 @@ WORLD_NAME = "cart_pole_train"
 MODEL_NAME = "cart_pole"
 STEP_PERIOD = 0.005  # matches training's 5 x 1ms action cadence
 MAX_ITERATIONS = 50000  # ~250s, mirrors cart_pole_env.py's run_inference bound
+# reset.all was measured (via a dedicated scratch repro, not just here) to
+# occasionally not take effect on the very first request - the post-reset
+# observation reads back nearly identical to the pre-reset one, independent
+# of the RPC's own ok flag (seen with both ok=True and ok=False). Across two
+# separate 10-consecutive-reset stress runs, retrying always recovered
+# within 2 attempts (6/10 and non-trivial 2nd-attempt successes, 0 needing a
+# 3rd) - this cap gives a large margin over that.
+MAX_RESET_ATTEMPTS = 5
 
 
 class _ObsSpaceStub(gym.Env):
@@ -95,13 +103,30 @@ def _kill_stale_gz_processes():
     it looks terminated but isn't. Escalate to SIGKILL for anything still
     alive after the graceful attempt, so a stale instance can never be
     left registered on the transport bus for the new launch to collide
-    with."""
-    subprocess.run(["pkill", "-f", "gz sim"], check=False)
+    with.
+
+    Matches are scoped as narrowly as each process type allows rather than
+    a bare "gz sim" substring - a plain "gz sim" pkill has a wide blast
+    radius and could kill an unrelated gz sim session on the same machine
+    (e.g. ros2_ws's own robot_launch, which runs a completely different
+    world). The server is matched on this exact SDF path, since it's the
+    one process here that's uniquely identifiable. The GUI (`gz sim -g`)
+    carries no world-identifying argument at all - it just attaches to
+    whatever's on the transport bus - so it can only be scoped down to
+    "launched in GUI mode", not to this specific world; that residual
+    ambiguity is inherent to how `gz sim -g` works, not something this
+    function can narrow further."""
+    _pkill_and_escalate(f"gz sim -s -r {SDF_PATH}")
+    _pkill_and_escalate("gz sim -g")
+
+
+def _pkill_and_escalate(pattern):
+    subprocess.run(["pkill", "-f", pattern], check=False)
     time.sleep(1)
     still_alive = subprocess.run(
-        ["pgrep", "-f", "gz sim"], capture_output=True, check=False)
+        ["pgrep", "-f", pattern], capture_output=True, check=False)
     if still_alive.returncode == 0:
-        subprocess.run(["pkill", "-9", "-f", "gz sim"], check=False)
+        subprocess.run(["pkill", "-9", "-f", pattern], check=False)
         time.sleep(1)
 
 
@@ -122,8 +147,10 @@ def _reset_world(node):
     re-triggering on the same still-diverging state.
 
     reset.all does not have this problem for this project's generated
-    world: measured directly, position and velocity both snap to ~0
-    within one physics step of a reset.all call, and joint_state keeps
+    world: measured directly (polling position/velocity every 20-50ms
+    after the reset request returns, the resolution actually used - not
+    validated at physics-step granularity), position and velocity read at
+    or near 0 on the first post-reset poll, and joint_state keeps
     publishing afterward at full rate across repeated resets (unlike the
     unrelated commander/robomaster_rale world documented in
     ros2_ws/src/CLAUDE.md, where reset.all's entity teardown permanently
@@ -170,6 +197,12 @@ def run_inference(model, normalizer, effort_limit):
         print("Launching Gazebo server...")
         gz_server = subprocess.Popen(["gz", "sim", "-s", "-r", SDF_PATH])
         time.sleep(3)
+        if gz_server.poll() is not None:
+            raise RuntimeError(
+                f"gz sim server exited immediately (code {gz_server.returncode}) "
+                "- check for a stale process still holding the SDF/transport "
+                "bus, or an SDF validation error"
+            )
 
         print("Launching Gazebo GUI...")
         gz_gui = subprocess.Popen(["gz", "sim", "-g"])
@@ -217,6 +250,17 @@ def run_inference(model, normalizer, effort_limit):
             if abs(cart_pos) > CART_POSITION_LIMIT or abs(pole_pos) > POLE_PITCH_LIMIT:
                 episode_len = time.monotonic() - episode_start
                 print(f"Cart-pole out of bounds after {episode_len:.2f}s, resetting world...")
+                # ApplyJointForce has no Reset() and simply holds the last
+                # commanded force (confirmed via nm -DC on its .so) - left
+                # un-zeroed, the pre-fall +/-30N force stays latched through
+                # reset.all and keeps driving the freshly-reset cart/pole,
+                # which measurably caused runaway "0.00s, resetting
+                # world..." storms (dozens of consecutive resets, request
+                # ok=True every time) before this fix. Zero it before
+                # resetting so nothing is still pushing post-reset.
+                zero_msg = Double()
+                zero_msg.data = 0.0
+                force_pub.publish(zero_msg)
                 # JointStatePublisher publishes at the physics-step rate
                 # (~1kHz, no rate limit configured) - issuing node.request()
                 # while this node's own subscription callback is firing at
@@ -224,17 +268,40 @@ def run_inference(model, normalizer, effort_limit):
                 # binding (confirmed in Task 6's
                 # verify_reset_preserves_joint_state.py). Unsubscribe for
                 # the duration of the request, resubscribe once it returns.
-                node.unsubscribe(joint_state_topic)
-                reset_ok = _reset_world(node)
-                latest["obs"] = None
-                node.subscribe(Model, joint_state_topic, on_joint_state)
-                time.sleep(0.5)  # let the reset propagate before next read
-                _wait_for_obs(latest)
-                cart_pos, _cart_vel, pole_pos, _pole_vel = latest["obs"]
-                if abs(cart_pos) > CART_POSITION_LIMIT or abs(pole_pos) > POLE_PITCH_LIMIT:
+                #
+                # reset.all was separately measured (dedicated scratch
+                # repro, not just this loop) to occasionally not take
+                # effect at all on its first attempt - the post-reset
+                # observation reads back nearly identical to the pre-reset
+                # one, independent of the RPC's own ok flag (reproduced
+                # with both ok=True and ok=False). Retrying immediately
+                # reliably recovers, always within 2 attempts across two
+                # separate 10-consecutive-reset stress runs - so this loop
+                # retries up to MAX_RESET_ATTEMPTS times, checking the
+                # FIRST fresh post-reset reading each time (not one taken
+                # after a deliberate delay - a previous version slept 0.5s
+                # before reading, during which the still-latched pre-fix
+                # force could drive the system back out of bounds before
+                # the postcondition was ever evaluated, so a genuine
+                # runaway-reset storm would read as a normal in-bounds
+                # state instead of raising).
+                reset_ok = None
+                for attempt in range(1, MAX_RESET_ATTEMPTS + 1):
+                    node.unsubscribe(joint_state_topic)
+                    reset_ok = _reset_world(node)
+                    latest["obs"] = None
+                    node.subscribe(Model, joint_state_topic, on_joint_state)
+                    _wait_for_obs(latest)
+                    cart_pos, _cart_vel, pole_pos, _pole_vel = latest["obs"]
+                    if abs(cart_pos) <= CART_POSITION_LIMIT and abs(pole_pos) <= POLE_PITCH_LIMIT:
+                        if attempt > 1:
+                            print(f"  (reset took effect on attempt {attempt})")
+                        break
+                else:
                     raise RuntimeError(
-                        f"world reset did not take effect (request ok={reset_ok}, "
-                        f"post-reset cart={cart_pos:.4f} pole={pole_pos:.4f})"
+                        f"world reset did not take effect after {MAX_RESET_ATTEMPTS} "
+                        f"attempts (last request ok={reset_ok}, post-reset "
+                        f"cart={cart_pos:.4f} pole={pole_pos:.4f})"
                     )
                 episode_start = time.monotonic()
 
@@ -242,6 +309,8 @@ def run_inference(model, normalizer, effort_limit):
             remaining = STEP_PERIOD - elapsed
             if remaining > 0:
                 time.sleep(remaining)
+
+        print(f"Reached MAX_ITERATIONS ({MAX_ITERATIONS}) without interruption, stopping.")
 
     except KeyboardInterrupt:
         print("\nStopping...")
