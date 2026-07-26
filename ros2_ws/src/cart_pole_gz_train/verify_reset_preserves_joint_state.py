@@ -46,11 +46,19 @@ try:
     # python3, with timeouts up to 15s and with the request issued from a
     # second Node instance - so it's a genuine contention/backpressure bug
     # in the binding, not a venv/protobuf mismatch or a too-short timeout).
-    # Unsubscribing for the duration of the request sidesteps it: the
-    # thing under test is whether JointStatePublisher keeps publishing
-    # across reset.model_only, not whether *our own* subscription survives
-    # uninterrupted, so dropping and re-establishing it around the request
-    # is a faithful test of the invariant this script exists to check.
+    # Unsubscribing for the duration of the request sidesteps it, but note
+    # this narrows what's actually tested: the "after" count comes from a
+    # brand-new subscription created after the reset returns, not from the
+    # original subscription surviving the reset uninterrupted, so this
+    # confirms "a fresh subscription resumes receiving after reset" rather
+    # than the plan's original, stronger claim that "an already-open
+    # subscription keeps receiving through the reset." That narrower scope
+    # is intentional and sufficient here: Task 7's run_inference.py is
+    # designed to drive its own episode resets with this exact same
+    # unsubscribe-before-reset/resubscribe-after-reset pattern (see its
+    # main loop's call to _reset_world), so this script validates exactly
+    # the pattern production code will actually use, not a stand-in for a
+    # different one.
     node.unsubscribe(TOPIC)
 
     request = WorldControl()
