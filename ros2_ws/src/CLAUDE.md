@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-This covers the four packages inside `ros2_ws/src/`. For the workspace-level build quirk (venv `PATH` shadowing `catkin_pkg`) and how this workspace relates to the top-level `cart_pole/` project, see the root `CLAUDE.md`'s "ros2_ws" section — that context isn't repeated here.
+This covers the four packages inside `ros2_ws/src/`, plus the non-package `cart_pole_gz_train/` folder that also lives there. For the workspace-level build quirk (venv `PATH` shadowing `catkin_pkg`) and how this workspace relates to the top-level `cart_pole/` project, see the root `CLAUDE.md`'s "ros2_ws" section — that context isn't repeated here.
 
 ## Running
 
@@ -55,3 +55,22 @@ Single-purpose package: its launch file starts one parameterized `robot_state_pu
 - Publishes a scalar force to `/cart_controller/command`, computed from a discretized action index (`num_actions=10`) via `force = action * 16 / 9 - 8`, mapping the discrete action space onto a continuous force range.
 - Resets between episodes by calling `/world/robomaster_rale/control` with `reset.model_only = True`, deliberately **not** `reset.all` — confirmed via live testing that `reset.all` tears down and recreates every entity, which permanently stops `JointStatePublisher` from advertising its gz-transport topic after the first reset (silently freezing `/joint_states` for the rest of training). `model_only` resets poses/velocities without that teardown.
 - Runs training synchronously inside the main thread (`node.simulate(...)` in a loop up to `num_episodes=1000`), with `rclpy.spin` on a separate daemon thread purely to service the `/joint_states` subscription and the reset service client in the background.
+
+## `cart_pole_gz_train` (not a package)
+
+`ros2_ws/src/cart_pole_gz_train/` is deliberately **not** a colcon package — it has no `package.xml`/`CMakeLists.txt`, so `colcon build` skips it entirely. It trains a Stable-Baselines3 PPO policy for the same cart-pole robot headlessly and in-process via `gz.sim8.TestFixture`, with no `rclpy`, no `ros_gz_bridge`, and no real-time pacing — the fast alternative to `commander`'s live over-ROS DQN, ported from the root `cart_pole/` project's approach but driving the real `cart_joint`/`pole_joint` through the ECM instead of publishing wrenches.
+
+Run it from the **repo root** (not from `ros2_ws/`):
+
+```bash
+PYTHONPATH=/usr/lib/python3/dist-packages uv run ros2_ws/src/cart_pole_gz_train/train_cart_pole.py
+```
+
+Two environment prerequisites, both non-obvious:
+
+- **`ros2_ws` must already be `colcon build`-ed.** `world_builder.py` regenerates the training world from `robot_description/robot/cart_pole.urdf.xacro` on every run by shelling out to `xacro` and `gz sdf -p`, and it sources `ros2_ws/install/setup.bash` (with `.venv` stripped from `PATH`) to do so. Without a built workspace, `xacro` fails with `PackageNotFoundError: robot_description`.
+- The generated `cart_pole_train.sdf` / `_generated.urdf` are **outputs, not sources** — gitignored, rewritten once per process. Don't hand-edit them; edit the xacro or `world_builder.py`'s postprocessing.
+
+**Any consumer of the saved policy must also load `vecnormalize.pkl`.** `train_cart_pole.py` writes two files side by side: `cart_pole_gz_train_ppo.zip` and `vecnormalize.pkl`. The policy was trained on `VecNormalize`-normalized observations (this env's velocity dimensions run 10-30x larger than its position dimensions, which stalled learning outright until normalization was added), so the running mean/std are part of the policy's expected input contract. Loading the `.zip` alone and feeding it raw observations does not degrade gracefully — it silently collapses to random-baseline performance. Load it as `VecNormalize.load(path, venv)` with `venv.training = False` (see `evaluate_policy.py`, which hard-errors rather than proceeding if the stats are missing).
+
+Verification here follows the repo's no-pytest convention: `verify_world_builder.py`, `verify_dynamics.py`, `verify_scorer.py` are scratch scripts run the same way as the trainer. `verify_dynamics.py`/`verify_scorer.py` specifically assert the robot spawns *grounded and at rest* (base at z=0.3, pole undisturbed) and that max effort yields ~`effort_limit/cart_mass` acceleration — regression guards for a bug where the model spawned airborne and landed with its pole collision cylinder speared through the ground plane.

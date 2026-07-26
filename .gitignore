@@ -8,4 +8,16 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Generated artifacts (root cart_pole/ project)
 cart_pole_ppo.zip
+
+# Generated artifacts (ros2_ws/src/cart_pole_gz_train/) - the world SDF and
+# intermediate URDF are regenerated from the xacro on every run, and the
+# policy/normalization stats are training output. None should be committed:
+# a checked-in cart_pole_train.sdf in particular would be a second, silently
+# drifting source of truth for the robot's physical parameters.
+ros2_ws/src/cart_pole_gz_train/cart_pole_train.sdf
+ros2_ws/src/cart_pole_gz_train/_generated.urdf
+ros2_ws/src/cart_pole_gz_train/cart_pole_gz_train_ppo.zip
+ros2_ws/src/cart_pole_gz_train/vecnormalize.pkl
