@@ -20,10 +20,6 @@ import numpy as np
 from train_cart_pole import CustomCartPoleGzTrain
 from gz_scorer import CART_POSITION_LIMIT, POLE_PITCH_LIMIT
 
-# Maximum steps per episode (2000 steps = 10 seconds at 5ms per step).
-# Prevents infinite loops when a policy successfully balances indefinitely.
-MAX_STEPS = 2000
-
 
 def _termination_cause(obs):
     cart_x, _cart_v, pole_p, _pole_v = obs
@@ -34,7 +30,7 @@ def _termination_cause(obs):
     return "unknown"
 
 
-def run_random(n_episodes):
+def run_random(n_episodes, max_steps):
     env = CustomCartPoleGzTrain()
     lengths = []
     causes = []
@@ -42,14 +38,22 @@ def run_random(n_episodes):
         obs, _info = env.reset()
         steps = 0
         terminated = False
-        while not terminated and steps < MAX_STEPS:
+        while not terminated and steps < max_steps:
             action = env.action_space.sample()
             obs, _reward, terminated, _truncated, _info = env.step(action)
             steps += 1
 
-        # Distinguish genuine termination from step cap
-        if steps >= MAX_STEPS:
-            cause_str = "reached step cap (still balancing)"
+        # Distinguish genuine termination from step cap. Checking `terminated`
+        # first matters: an episode that genuinely falls on exactly its
+        # max_steps'th step must be reported as a real fall, not misreported
+        # as "still balancing" just because the counters hit their cap on the
+        # same step.
+        if not terminated and steps >= max_steps:
+            cart_x, _cart_v, pole_p, _pole_v = obs
+            cause_str = (
+                f"reached step cap (still balancing: cart_x={cart_x:.4f}, "
+                f"pole_pitch={pole_p:.4f})"
+            )
             causes.append("step_cap")
         else:
             cause_str = _termination_cause(obs)
@@ -61,7 +65,7 @@ def run_random(n_episodes):
     return lengths, causes
 
 
-def run_trained(n_episodes, model_path, vecnorm_path):
+def run_trained(n_episodes, model_path, vecnorm_path, max_steps):
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
@@ -92,15 +96,29 @@ def run_trained(n_episodes, model_path, vecnorm_path):
         obs = venv.reset()
         steps = 0
         done = False
-        while not done and steps < MAX_STEPS:
+        while not done and steps < max_steps:
             action, _state = model.predict(obs, deterministic=True)
             obs, _reward, done_arr, info = venv.step(action)
             done = bool(done_arr[0])
             steps += 1
 
-        # Distinguish genuine termination from step cap
-        if steps >= MAX_STEPS:
-            cause_str = "reached step cap (still balancing)"
+        # Distinguish genuine termination from step cap. Checking `done` first
+        # matters: an episode that genuinely falls on exactly its max_steps'th
+        # step must be reported as a real fall, not misreported as "still
+        # balancing" just because the counters hit their cap on the same step.
+        if not done and steps >= max_steps:
+            # obs here is the live (not terminal) observation, still
+            # VecNormalize-normalized - unnormalize back to raw units so the
+            # printed cart_x/pole_pitch are directly comparable to the raw
+            # termination thresholds, and demonstrate (not just assert) that
+            # the policy is genuinely balanced at the cap rather than about
+            # to fall.
+            raw_obs = venv.unnormalize_obs(obs[0])
+            cart_x, _cart_v, pole_p, _pole_v = raw_obs
+            cause_str = (
+                f"reached step cap (still balancing: cart_x={cart_x:.4f}, "
+                f"pole_pitch={pole_p:.4f})"
+            )
             causes.append("step_cap")
         else:
             # DummyVecEnv stores the true pre-reset obs in info on episode end.
@@ -138,11 +156,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vecnorm", default=os.path.join(FILE_DIR, "vecnormalize.pkl")
     )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=2000,
+        help="Maximum steps per episode (default 2000 = 10 seconds at 5ms "
+        "per step). Prevents infinite loops when a policy successfully "
+        "balances indefinitely.",
+    )
     args = parser.parse_args()
 
     if args.mode == "random":
-        lengths, causes = run_random(args.episodes)
+        lengths, causes = run_random(args.episodes, args.max_steps)
         summarize("random policy", lengths, causes)
     else:
-        lengths, causes = run_trained(args.episodes, args.model, args.vecnorm)
+        lengths, causes = run_trained(
+            args.episodes, args.model, args.vecnorm, args.max_steps
+        )
         summarize("trained policy", lengths, causes)

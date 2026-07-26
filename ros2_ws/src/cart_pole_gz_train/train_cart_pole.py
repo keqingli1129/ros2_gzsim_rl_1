@@ -19,12 +19,16 @@ class CustomCartPoleGzTrain(gym.Env):
     def __init__(self, env_config=None):
         self.env = GzCartPoleScorer()
         self.action_space = gym.spaces.Discrete(2)
-        # Bounds reflect this robot's real joint limits (cart_joint +/-1m,
-        # pole_joint +/-1.7 rad declared in the xacro), not the root
-        # project's arbitrary bounds tuned for its unrelated model.
+        # Bounds are derived from gz_scorer's CART_POSITION_LIMIT/
+        # POLE_PITCH_LIMIT (this robot's termination thresholds: cart_joint
+        # +/-0.9m, pole_joint +/-0.48rad - not the root project's arbitrary
+        # bounds tuned for its unrelated model, and not this joint's harder
+        # mechanical stops either, +/-1m / +/-1.7rad) rather than hardcoded
+        # literals, so the two can't silently drift apart if the termination
+        # thresholds ever change.
         self.observation_space = gym.spaces.Box(
-            np.array([-1.0, -np.inf, -1.7, -np.inf], dtype=np.float32),
-            np.array([1.0, np.inf, 1.7, np.inf], dtype=np.float32),
+            np.array([-CART_POSITION_LIMIT, -np.inf, -POLE_PITCH_LIMIT, -np.inf], dtype=np.float32),
+            np.array([CART_POSITION_LIMIT, np.inf, POLE_PITCH_LIMIT, np.inf], dtype=np.float32),
             (4,), np.float32,
         )
 

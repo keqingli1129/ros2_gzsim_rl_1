@@ -8,7 +8,6 @@ XACRO_REL_PATH = "ros2_ws/src/robot_description/robot/cart_pole.urdf.xacro"
 _PRIMITIVE_GEOMETRY = {
     "base_footprint": ("box", "0.4 0.4 0.6"),
     "cart_link": ("box", "0.3 0.3 0.15"),
-    "pole_link": ("cylinder", None),  # handled specially below
 }
 
 # The pole's collision cylinder. The real pole occupies pole_link-frame

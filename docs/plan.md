@@ -612,10 +612,18 @@ git commit -m "feat(cart_pole_gz_train): add GzCartPoleScorer with joint-based E
 > not the deterministic policy's, which is unbounded. Randomizing the
 > initial state remains an open follow-up.
 >
-> Note also that `evaluate_policy.py` has **no step cap**, so
+> ~~Note also that `evaluate_policy.py` has **no step cap**, so
 > `evaluate_policy.py trained` now runs forever against this policy; the
 > numbers above came from a capped scratch harness. Adding a cap is an
-> open follow-up.
+> open follow-up.~~ **Amended (final whole-branch review, round 2):** a step
+> cap (`MAX_STEPS`/`--max-steps`, default 2000) has since landed in
+> `evaluate_policy.py` — this is no longer an open follow-up. A subsequent
+> review round found and fixed two bugs in that cap's implementation: the
+> cap check ran *before* the `terminated`/`done` check, so a genuine fall on
+> exactly the cap'th step was misreported as "reached step cap (still
+> balancing)"; and the "still balancing" claim wasn't backed by printing the
+> actual `cart_x`/`pole_pitch` at the cap. Both are fixed, and the cap is now
+> a `--max-steps` CLI flag rather than a hardcoded constant.
 
 **Files:**
 - Create: `ros2_ws/src/cart_pole_gz_train/train_cart_pole.py`
