@@ -53,14 +53,25 @@ def run_trained(n_episodes, model_path, vecnorm_path):
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
+    # The saved policy was trained on VecNormalize-normalized observations,
+    # so feeding it raw ones is not a degraded mode - it is the exact bug
+    # Task 5 was retrained to fix, and it fails silently (the policy simply
+    # collapses back to random-baseline episode lengths). Refuse to run
+    # rather than print a warning and produce a plausible-looking number.
+    if not vecnorm_path or not os.path.exists(vecnorm_path):
+        raise SystemExit(
+            f"ERROR: VecNormalize stats not found at {vecnorm_path!r}.\n"
+            "The trained policy expects observations normalized with the "
+            "running statistics saved during training; evaluating without "
+            "them silently reproduces random-baseline performance. Re-run "
+            "train_cart_pole.py (which writes vecnormalize.pkl next to the "
+            "model) or pass --vecnorm explicitly."
+        )
     venv = DummyVecEnv([lambda: CustomCartPoleGzTrain()])
-    if vecnorm_path and os.path.exists(vecnorm_path):
-        venv = VecNormalize.load(vecnorm_path, venv)
-        venv.training = False
-        venv.norm_reward = False
-        print(f"  loaded VecNormalize stats from {vecnorm_path}")
-    else:
-        print("  WARNING: no VecNormalize stats found, using raw observations")
+    venv = VecNormalize.load(vecnorm_path, venv)
+    venv.training = False
+    venv.norm_reward = False
+    print(f"  loaded VecNormalize stats from {vecnorm_path}")
     model = PPO.load(model_path)
 
     lengths = []
@@ -75,14 +86,11 @@ def run_trained(n_episodes, model_path, vecnorm_path):
             done = bool(done_arr[0])
             steps += 1
         # DummyVecEnv stores the true pre-reset obs in info on episode end.
-        # VecNormalize normalizes this if loaded, so we unnormalize it back to
-        # raw units for threshold comparison. Fall back to the (already-reset) obs
-        # if terminal_observation is unavailable.
-        final_obs = info[0].get("terminal_observation", obs[0])
-        final_obs = np.asarray(final_obs)
-        # If VecNormalize is loaded, unnormalize the terminal observation
-        if isinstance(venv, VecNormalize):
-            final_obs = venv.unnormalize_obs(final_obs)
+        # VecNormalize normalizes it, so unnormalize back to raw units before
+        # comparing against the raw termination thresholds. Fall back to the
+        # (already-reset) obs if terminal_observation is unavailable.
+        final_obs = np.asarray(info[0].get("terminal_observation", obs[0]))
+        final_obs = venv.unnormalize_obs(final_obs)
         causes.append(_termination_cause(final_obs))
         lengths.append(steps)
         print(f"  episode {ep + 1}: {steps} steps (terminated on {causes[-1]})")
