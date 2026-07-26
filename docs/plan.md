@@ -17,7 +17,7 @@
 - No pytest anywhere in this repo (`cart_pole/` or `ros2_ws/`) — verification is scratch-script based, run against real `TestFixture`/`gz sdf` behavior, matching existing convention.
 - `cart_joint`'s declared effort limit (30N) is a **hard actuator clamp enforced by the physics engine**, not just metadata — verified: commanding 1,000,000N produces the same realized acceleration as 30N. Action force magnitude must be read from `Joint.effort_limits(ecm)[0]` at runtime, not hardcoded.
 - `cart_joint`'s declared position limit (±1m) is a **hard mechanical stop** — verified: sustained max force drives `position(ecm)` to exactly `1.0` and it stays pinned there (velocity collapses to ~0). The out-of-bounds termination threshold must be well inside this (e.g. `0.9`), **not** the root project's unrelated `4.8`, which this joint physically cannot reach.
-- The generated world's root model must be given an initial `<pose>` lifting it clear of the ground plane (verified root cause of a serious bug — see Task 2) — at `z=0` the primitive collision geometry interpenetrates the ground plane on load, and the resulting contact-resolution forces dominate the tiny prismatic joint's dynamics, making force application look completely broken (a 1,000,000N test force produced ~0.02 m/s after 200ms) even though `set_force` was working correctly the whole time.
+- The generated world's root model must be given an initial `<pose>` lifting it clear of the ground plane (verified root cause of a serious bug — see Task 2) — at `z=0` the primitive collision geometry interpenetrates the ground plane on load, and the resulting contact-resolution forces dominate the tiny prismatic joint's dynamics, making force application look completely broken (a 1,000,000N test force produced ~0.02 m/s after 200ms) even though `set_force` was working correctly the whole time. **(Amended — see Task 2's amendment: the lift is real but must be exactly `z=0.3`, half of `base_footprint`'s collision-box height, and it is only half the story; the pole's collision cylinder also needs a `-length/2` pose offset.)**
 
 ---
 
@@ -107,6 +107,47 @@ git commit -m "feat(cart_pole_gz_train): add xacro-to-SDF conversion pipeline"
 ---
 
 ### Task 2: World generation — postprocessing and world wrapping
+
+> **Amendment (post-implementation, from final whole-branch review):** the
+> `<pose>0 0 2 0 0 0</pose>` lift in the `wrap_in_world` code below was a
+> **misdiagnosis** that masked a geometry bug rather than fixing it.
+> `postprocess_model_sdf` emitted the pole's collision cylinder with no
+> `<pose>`, so it sat centred on `pole_link`'s origin (pole-frame z ∈
+> [-0.5, +0.5]) while the real pole occupies z ∈ [-1, 0] (the xacro puts
+> `tip_link` at `0 0 -1` and the CoM at `-0.489554` relative to
+> `pole_link`; `pole_joint`'s 180°-about-y rotation then points that
+> direction up in the world). Half the cylinder therefore hung *below* the
+> joint, and on landing it speared straight through the ground plane.
+> Measured (zero applied force, free settle, then 30N for 200ms):
+>
+> | spawn z | pole collision | rest `base_z` | rest `pole_pitch` | cart accel |
+> | --- | --- | --- | --- | --- |
+> | none | offset (fixed) | 0.006 | 0.000 | 0.10 m/s² |
+> | 2.0 | centred (buggy) | 0.300 | **1.700 (at joint limit)** | 0.03 m/s² |
+> | 2.0 | offset (fixed) | 0.300 | 0.000 | 10.27 m/s² |
+> | **0.3** | **offset (fixed)** | **0.300** | **0.000** | **10.27 m/s²** |
+>
+> So: (a) a lift *is* genuinely needed — with none, the 88kg base spawns
+> half-buried and the contact solver never frees it (`base_z` crawls from
+> 0.002 to 0.006 over 6 simulated seconds) leaving `cart_joint` at ~1% of
+> its proper authority; but (b) `z=2` costs a ~590ms (~118 env step)
+> free-fall at the start of *every* episode, and with the buggy cylinder
+> the landing dragged `pole_joint` to its ±1.7rad limit and pinned the
+> cart — i.e. all prior training happened either mid-air or in a
+> contact-jammed regime, never in real grounded cart-pole dynamics.
+>
+> Fix: give the pole collision `<pose>0 0 -0.5 0 0 0</pose>` (derived as
+> `-length/2` from the cylinder's own declared length, not hardcoded), and
+> set the spawn lift to `SPAWN_Z = 0.3`, derived as half of
+> `base_footprint`'s 0.6m collision-box height so the box lands flush.
+> With both, `base_z` reads exactly 0.3000 at t=1ms and never moves, and
+> the cart accelerates at 10.27 m/s² against an ideal
+> `effort_limit/cart_mass` of 30/2.7 = 11.11 m/s² (the shortfall is joint
+> damping/friction plus the pole's reaction). `wrap_in_world` now also
+> raises instead of silently no-op'ing if its exact-match anchor is
+> missing, and `verify_world_builder.py` asserts both invariants
+> structurally (parsed from the XML, tied to the geometry sizes) rather
+> than string-matching a literal pose.
 
 **Files:**
 - Modify: `ros2_ws/src/cart_pole_gz_train/world_builder.py`
@@ -533,6 +574,48 @@ git commit -m "feat(cart_pole_gz_train): add GzCartPoleScorer with joint-based E
 > and self-review. A companion scratch script, `evaluate_policy.py`, was added
 > to run this before/after comparison (random vs. trained episode-length,
 > matching the repo's no-pytest convention).
+>
+> **Amendment 2 (final whole-branch review): the "453 vs 121" numbers above
+> are superseded.** They were measured against the broken world described in
+> Task 2's amendment, where every episode began with a ~590ms free-fall and
+> ended in a contact-jammed landing — so they measured falling and jamming,
+> not balancing. After fixing the pole collision offset and the spawn height,
+> and wrapping the env in `Monitor` (SB3 only auto-wraps `Monitor` when the
+> env handed to `PPO()` is not already a `VecEnv`, so passing the pre-built
+> `DummyVecEnv` had silently suppressed all `ep_rew_mean`/`ep_len_mean`
+> logging), the model was retrained from scratch for the same 100,000
+> timesteps (708s wall clock). Real numbers:
+>
+> - **Training curve** (now visible): `ep_len_mean` 143 → 175 → 211 → 254 →
+>   304 → 360 → 386 → 432 at 45k timesteps, then flat at **438** from ~50k
+>   onwards. `ep_rew_mean` tracks it exactly (flat +1/step reward).
+> - **Random baseline**, 15 episodes: mean **154.1** steps, range 99-269,
+>   std 53.6, all 15 terminating on the pole-angle limit.
+> - **Trained deterministic policy**, 15 episodes: **≥2000 steps every
+>   episode** — it never terminates. Runs were cut off at a 2000-step
+>   (10s sim) cap; at the cap the cart sits at x=+0.108 (limit 0.9) with
+>   pole_pitch=-0.0004 rad (limit 0.48), i.e. genuinely balanced, not
+>   drifting or stuck. So the honest comparison is **154.1 → >2000 steps
+>   (>13x, lower bound)**, not 121 → 453.
+> - **Causality control re-run** on the retrained model: same policy, same
+>   env, `vecnormalize.pkl` *not* loaded → collapses to exactly 246 steps
+>   every episode, terminating on the cart-position limit. Still inside the
+>   random baseline's 99-269 range, so the VecNormalize dependency is
+>   unchanged and real. `evaluate_policy.py` now hard-errors on missing
+>   stats instead of warning and continuing.
+>
+> Two artifacts of the env being fully deterministic (no initial-state
+> randomization — `reset(seed=...)` is ignored) show up in these numbers and
+> are worth knowing before reading too much into them: every trained episode
+> is bit-identical, and the 438-step training plateau is the *stochastic*
+> rollout policy's score (it occasionally samples the losing action),
+> not the deterministic policy's, which is unbounded. Randomizing the
+> initial state remains an open follow-up.
+>
+> Note also that `evaluate_policy.py` has **no step cap**, so
+> `evaluate_policy.py trained` now runs forever against this policy; the
+> numbers above came from a capped scratch harness. Adding a cap is an
+> open follow-up.
 
 **Files:**
 - Create: `ros2_ws/src/cart_pole_gz_train/train_cart_pole.py`
@@ -633,6 +716,6 @@ git commit -m "feat(cart_pole_gz_train): add PPO training entrypoint"
 
 ## Notes for the implementer
 
-- `cart_pole_train.sdf` is regenerated by `GzCartPoleScorer._build_fixture()` only if it doesn't already exist at `SDF_PATH` — delete it manually to force regeneration after editing the xacro.
-- If Task 3 or Task 4's verification shows near-zero velocity again despite Task 2's lift fix, re-check the model's pose offset didn't get lost — `wrap_in_world`'s string replace on `'<model name="cart_pole">'` is exact-match and silently no-ops if the tag's whitespace/attribute order changes upstream (e.g. after a `gz sdf` version bump reformats its output).
+- ~~`cart_pole_train.sdf` is regenerated by `GzCartPoleScorer._build_fixture()` only if it doesn't already exist at `SDF_PATH` — delete it manually to force regeneration after editing the xacro.~~ **Amended:** existence-gating meant a leftover file from any previous process (possibly a different checkout) was silently reused forever, contradicting the PRD's "no silent fallback to a stale cached SDF". `gz_scorer.ensure_world_generated()` now regenerates it exactly once per process, from `GzCartPoleScorer.__init__` — not on every `reset()` (thousands per run, and the world is fixed for a run's lifetime) and not conditional on the file existing.
+- If Task 3 or Task 4's verification shows near-zero velocity again despite Task 2's lift fix, re-check the model's pose offset didn't get lost — `wrap_in_world`'s string replace on `'<model name="cart_pole">'` is exact-match and silently no-ops if the tag's whitespace/attribute order changes upstream (e.g. after a `gz sdf` version bump reformats its output). **Amended:** it now raises instead of silently no-op'ing, and `verify_dynamics.py` asserts the resting height directly.
 - `ros2_ws` must be `colcon build`'t before this script's first run (needed for `xacro`'s `ament_index_python` package resolution) — this is an existing artifact of the workspace, not something this feature needs to build itself.
