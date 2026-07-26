@@ -734,6 +734,8 @@ This task exists to check a specific risk before Task 7 depends on it: `ros2_ws/
 
 The following was already confirmed live (via `gz topic -l`/`-i`/`-e` against a running `cart_pole_train.sdf` server) and can be taken as given: the server exposes `/model/cart_pole/joint/cart_joint/cmd_force` (`gz.msgs.Double`, subscribed by `ApplyJointForce`), `/world/cart_pole_train/model/cart_pole/joint_state` (`gz.msgs.Model`, published by `JointStatePublisher`, each `joint` entry has `name` and `axis1.position`/`axis1.velocity`), and `/world/cart_pole_train/control` (`gz.msgs.WorldControl` → `gz.msgs.Boolean`). `gz.transport13`/`gz.msgs10` import fine without the `ctypes.CDLL(".../libgz-sim8.so", ...)` preload (confirmed empirically) — that preload is specifically for `gz.sim8`'s `TestFixture`/ECM bindings, which this script never touches.
 
+> **Amendment (post-implementation):** the literal script below deadlocks as written. `JointStatePublisher` has no rate limit in the generated SDF and publishes at the physics-step rate (~1kHz, confirmed empirically: ~2000 msgs over a 2s sleep) — issuing `node.request()` while this node's own subscription callback is firing at that rate reliably times out `gz.transport13`'s Python binding (reproduced identically under `uv run` and plain system `python3`, at timeouts up to 15s, and from a second `Node` instance — ruling out a venv/protobuf mismatch, a too-short timeout, or node-identity contention; it's a genuine contention bug between a high-rate subscriber callback and a concurrent request in the same binding). Fix: `node.unsubscribe(TOPIC)` immediately before the request, `node.subscribe(TOPIC, ...)` again immediately after — the "after" message count then comes from a freshly-established subscription right after the reset returns, which still faithfully tests the invariant under test (does `JointStatePublisher` keep publishing across `reset.model_only`). **This same pattern is required in Task 7's `run_inference.py`**, whose main loop keeps the same subscription alive across the same reset call — its code block already reflects the fix.
+
 - [ ] **Step 1: Write the verification script**
 
 ```python
@@ -755,6 +757,8 @@ from gz.msgs10.boolean_pb2 import Boolean
 sdf_path = os.path.join(FILE_DIR, "cart_pole_train.sdf")
 generate_training_world(sdf_path)
 
+TOPIC = "/world/cart_pole_train/model/cart_pole/joint_state"
+
 gz_server = subprocess.Popen(["gz", "sim", "-s", "-r", sdf_path])
 try:
     time.sleep(4)  # let the server come up and start publishing
@@ -766,15 +770,20 @@ try:
     def on_joint_state(_msg):
         counts[phase["value"]] += 1
 
-    node.subscribe(
-        Model, "/world/cart_pole_train/model/cart_pole/joint_state",
-        on_joint_state)
+    node.subscribe(Model, TOPIC, on_joint_state)
 
     time.sleep(2)
     assert counts["before"] > 0, (
         "no joint_state messages received before reset - is the server up "
         "and is JointStatePublisher declared in the generated SDF?"
     )
+
+    # JointStatePublisher has no rate limit here and publishes at the
+    # physics-step rate (~1kHz) - node.request() reliably deadlocks while
+    # this node's own subscription callback is firing at that rate (see
+    # this task's Amendment above). Unsubscribing for the duration of the
+    # request sidesteps it without weakening the invariant under test.
+    node.unsubscribe(TOPIC)
 
     request = WorldControl()
     request.reset.model_only = True
@@ -783,6 +792,7 @@ try:
     assert ok, "reset.model_only request failed"
 
     phase["value"] = "after"
+    node.subscribe(Model, TOPIC, on_joint_state)
     time.sleep(2)
 
     assert counts["after"] > 0, (
@@ -987,9 +997,8 @@ def run_inference(model, normalizer, effort_limit):
                 return  # mid-reset snapshot missing a joint; skip it
             latest["obs"] = obs
 
-        node.subscribe(
-            Model, f"/world/{WORLD_NAME}/model/{MODEL_NAME}/joint_state",
-            on_joint_state)
+        joint_state_topic = f"/world/{WORLD_NAME}/model/{MODEL_NAME}/joint_state"
+        node.subscribe(Model, joint_state_topic, on_joint_state)
 
         print("Waiting for first joint_state message...")
         _wait_for_obs(latest)
@@ -1012,7 +1021,16 @@ def run_inference(model, normalizer, effort_limit):
             if abs(cart_pos) > CART_POSITION_LIMIT or abs(pole_pos) > POLE_PITCH_LIMIT:
                 episode_len = time.monotonic() - episode_start
                 print(f"Cart-pole out of bounds after {episode_len:.2f}s, resetting world...")
+                # JointStatePublisher publishes at the physics-step rate
+                # (~1kHz, no rate limit configured) - issuing node.request()
+                # while this node's own subscription callback is firing at
+                # that rate reliably deadlocks gz.transport13's Python
+                # binding (confirmed in Task 6's
+                # verify_reset_preserves_joint_state.py). Unsubscribe for
+                # the duration of the request, resubscribe once it returns.
+                node.unsubscribe(joint_state_topic)
                 _reset_world(node)
+                node.subscribe(Model, joint_state_topic, on_joint_state)
                 latest["obs"] = None
                 time.sleep(0.5)  # let the reset propagate before next read
                 _wait_for_obs(latest)
