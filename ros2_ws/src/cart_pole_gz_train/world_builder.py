@@ -197,6 +197,13 @@ def wrap_in_world(model_sdf_text: str) -> str:
       <direction>-0.5 0.1 -0.9</direction>
     </light>
     <gui fullscreen="0">
+      <!-- A <gui> block in the SDF REPLACES gz-sim's entire default GUI
+           config rather than adding to it - the first version of this
+           block declared only the 3D View plugin below, which silently
+           dropped World Control/World Stats/Entity Tree (confirmed live:
+           the GUI rendered the robot correctly but had none of those
+           panels). All four are declared explicitly here so the GUI keeps
+           its normal controls plus the closer camera framing. -->
       <plugin name="3D View" filename="GzScene3D">
         <gz-gui>
           <title>3D View</title>
@@ -213,6 +220,44 @@ def wrap_in_world(model_sdf_text: str) -> str:
              no effect on headless training. -->
         <camera_pose>-2 -2 1.4 0 0.15 0.785</camera_pose>
       </plugin>
+      <plugin filename="WorldControl" name="World control">
+        <gz-gui>
+          <title>World control</title>
+          <property type="bool" key="showTitleBar">false</property>
+          <property type="bool" key="resizable">false</property>
+          <property type="double" key="height">72</property>
+          <property type="double" key="width">121</property>
+          <property type="double" key="z">1</property>
+          <property type="string" key="state">floating</property>
+          <anchors target="3D View">
+            <line own="left" target="left"/>
+            <line own="bottom" target="bottom"/>
+          </anchors>
+        </gz-gui>
+        <play_pause>true</play_pause>
+        <step>true</step>
+        <use_event>true</use_event>
+      </plugin>
+      <plugin filename="WorldStats" name="World stats">
+        <gz-gui>
+          <title>World stats</title>
+          <property type="bool" key="showTitleBar">false</property>
+          <property type="bool" key="resizable">false</property>
+          <property type="double" key="height">110</property>
+          <property type="double" key="width">290</property>
+          <property type="double" key="z">1</property>
+          <property type="string" key="state">floating</property>
+          <anchors target="3D View">
+            <line own="right" target="right"/>
+            <line own="bottom" target="bottom"/>
+          </anchors>
+        </gz-gui>
+        <sim_time>true</sim_time>
+        <real_time>true</real_time>
+        <real_time_factor>true</real_time_factor>
+        <iterations>true</iterations>
+      </plugin>
+      <plugin filename="EntityTree" name="Entity tree"/>
     </gui>
     <model name="ground_plane">
       <static>true</static>
