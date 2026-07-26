@@ -20,6 +20,10 @@ import numpy as np
 from train_cart_pole import CustomCartPoleGzTrain
 from gz_scorer import CART_POSITION_LIMIT, POLE_PITCH_LIMIT
 
+# Maximum steps per episode (2000 steps = 10 seconds at 5ms per step).
+# Prevents infinite loops when a policy successfully balances indefinitely.
+MAX_STEPS = 2000
+
 
 def _termination_cause(obs):
     cart_x, _cart_v, pole_p, _pole_v = obs
@@ -38,13 +42,21 @@ def run_random(n_episodes):
         obs, _info = env.reset()
         steps = 0
         terminated = False
-        while not terminated:
+        while not terminated and steps < MAX_STEPS:
             action = env.action_space.sample()
             obs, _reward, terminated, _truncated, _info = env.step(action)
             steps += 1
+
+        # Distinguish genuine termination from step cap
+        if steps >= MAX_STEPS:
+            cause_str = "reached step cap (still balancing)"
+            causes.append("step_cap")
+        else:
+            cause_str = _termination_cause(obs)
+            causes.append(cause_str)
+
         lengths.append(steps)
-        causes.append(_termination_cause(obs))
-        print(f"  episode {ep + 1}: {steps} steps (terminated on {causes[-1]})")
+        print(f"  episode {ep + 1}: {steps} steps (terminated on {cause_str})")
     env.close()
     return lengths, causes
 
@@ -80,20 +92,28 @@ def run_trained(n_episodes, model_path, vecnorm_path):
         obs = venv.reset()
         steps = 0
         done = False
-        while not done:
+        while not done and steps < MAX_STEPS:
             action, _state = model.predict(obs, deterministic=True)
             obs, _reward, done_arr, info = venv.step(action)
             done = bool(done_arr[0])
             steps += 1
-        # DummyVecEnv stores the true pre-reset obs in info on episode end.
-        # VecNormalize normalizes it, so unnormalize back to raw units before
-        # comparing against the raw termination thresholds. Fall back to the
-        # (already-reset) obs if terminal_observation is unavailable.
-        final_obs = np.asarray(info[0].get("terminal_observation", obs[0]))
-        final_obs = venv.unnormalize_obs(final_obs)
-        causes.append(_termination_cause(final_obs))
+
+        # Distinguish genuine termination from step cap
+        if steps >= MAX_STEPS:
+            cause_str = "reached step cap (still balancing)"
+            causes.append("step_cap")
+        else:
+            # DummyVecEnv stores the true pre-reset obs in info on episode end.
+            # VecNormalize normalizes it, so unnormalize back to raw units before
+            # comparing against the raw termination thresholds. Fall back to the
+            # (already-reset) obs if terminal_observation is unavailable.
+            final_obs = np.asarray(info[0].get("terminal_observation", obs[0]))
+            final_obs = venv.unnormalize_obs(final_obs)
+            cause_str = _termination_cause(final_obs)
+            causes.append(cause_str)
+
         lengths.append(steps)
-        print(f"  episode {ep + 1}: {steps} steps (terminated on {causes[-1]})")
+        print(f"  episode {ep + 1}: {steps} steps (terminated on {cause_str})")
     venv.close()
     return lengths, causes
 
