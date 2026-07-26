@@ -19,6 +19,22 @@ CART_POSITION_LIMIT = 0.9
 # that project's specific geometry.
 POLE_PITCH_LIMIT = 0.48
 
+# Whether this process has already regenerated the world SDF. The world is
+# regenerated exactly once per process (not once per reset - reset() runs
+# thousands of times per training run and the world never changes within a
+# run) and never reused from a previous process's leftover file, which
+# would silently train against a stale checkout of the xacro.
+_world_generated_this_process = False
+
+
+def ensure_world_generated(force: bool = False) -> str:
+    """Generate the training world SDF once per process, and return its path."""
+    global _world_generated_this_process
+    if force or not _world_generated_this_process:
+        generate_training_world(SDF_PATH)
+        _world_generated_this_process = True
+    return SDF_PATH
+
 
 class GzCartPoleScorer:
     """Gazebo System that scores the world via joint-based ECM access -
@@ -29,6 +45,11 @@ class GzCartPoleScorer:
 
     def __init__(self):
         self.command = None
+        # Regenerate the world from the live xacro before the first fixture
+        # of this process is built. Deliberately not gated on the file
+        # already existing: a leftover cart_pole_train.sdf from a previous
+        # run (possibly a different checkout) must never be silently reused.
+        ensure_world_generated()
         self._build_fixture()
         self.terminated = False
         self._initialized = False
@@ -40,9 +61,11 @@ class GzCartPoleScorer:
         calling server.reset_all() - same gz-sim8 bug as the root project:
         reset_all() desyncs the physics engine from the ECM while leaving
         entity IDs unchanged, silently breaking force application and state
-        reads without looking like a stale-handle problem."""
-        if not os.path.exists(SDF_PATH):
-            generate_training_world(SDF_PATH)
+        reads without looking like a stale-handle problem.
+
+        The world SDF itself is *not* regenerated here - reset() calls this
+        on every episode, and the world is fixed for the lifetime of a run.
+        Generation happens once per process, in __init__."""
         self.server = None
         self.fixture = None
         self.fixture = TestFixture(SDF_PATH)
