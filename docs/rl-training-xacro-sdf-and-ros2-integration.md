@@ -10,6 +10,103 @@ pipelines actually work (both the root `cart_pole/` project and its
 open for when a trained model needs to actually drive a robot through a
 real ROS2 node.
 
+## What this project is
+
+A cart-pole reinforcement-learning pipeline built on Gazebo Sim (gz-sim,
+Harmonic) and Stable-Baselines3 PPO, where the robot's canonical
+description lives in a ROS2 package as xacro. It has two deliberately
+separate parts:
+
+1. **A training/inference utility — not a ROS2 node, not a colcon
+   package.** Trains a PPO policy headlessly, in-process, talking to the
+   robot's physics directly through `gz.sim8` bindings (no `rclpy`, no
+   ROS2 topics — this is a deliberate speed choice, not an oversight).
+   Can also run inference with a live GUI by spawning `gz sim` as
+   subprocesses and driving the robot over `gz.transport13`. Produces two
+   artifacts that must travel together: the trained policy (`.zip`) and
+   its `VecNormalize` running statistics (`.pkl`) — using one without the
+   other silently collapses to random-baseline behavior, not a visible
+   error.
+2. **A future ROS2 control node — not yet built.** Loads those two
+   artifacts and drives the real/simulated robot over actual ROS2
+   topics/services (`ros_gz_bridge`, `/joint_states`, a force/effort
+   command topic, a reset service), fed the artifact paths via a launch
+   argument rather than baked in. This node only needs inference-time
+   dependencies (`stable-baselines3`, `torch`) — not the training stack.
+
+The dependency and process boundary between the two is deliberate, not
+incidental — see the next section for why.
+
+## Environment setup
+
+Two separate dependency worlds, kept deliberately independent (this
+separation is *why* part 2 above isn't built into the training utility):
+
+**1. RL/training Python environment** — a venv (this repo uses `uv`, any
+venv manager works) holding:
+
+- `stable-baselines3[extra]` — pulls in `gymnasium`, `torch`, and
+  `opencv-python` transitively.
+- An explicit override of `opencv-python` → `opencv-python-headless`.
+  SB3's *base* install (not just `[extra]`) requires opencv; the
+  GUI-capable build isn't needed for training/inference and cannot
+  coexist in the same environment as another package that needs real
+  `cv2.imshow()` windows (both provide the same `cv2` module name — one
+  install silently overwrites the other). With `uv`:
+
+  ```toml
+  # pyproject.toml
+  dependencies = [
+      "opencv-python-headless>=5.0.0",
+      "stable-baselines3[extra]>=2.9.0",
+  ]
+  [tool.uv]
+  override-dependencies = ["opencv-python-headless>=5.0.0"]
+  ```
+
+  Install with `uv sync`.
+
+**2. Gazebo Python bindings** — installed system-wide via apt (the
+`gz-harmonic` package group, Ubuntu Noble / gz-sim 8), landing in
+`/usr/lib/python3/dist-packages` (`gz.sim8`, `gz.common5`, `gz.math7`,
+`gz.transport13`, `gz.msgs10`). **Not** installed into the venv — exposed
+to it only at run time:
+
+```bash
+PYTHONPATH=/usr/lib/python3/dist-packages uv run <script.py>
+```
+
+Any script touching `gz.sim8` must also preload its shared library
+before any `gz.*` import, or symbol resolution fails:
+
+```python
+import ctypes
+ctypes.CDLL("/usr/lib/x86_64-linux-gnu/libgz-sim8.so", ctypes.RTLD_GLOBAL)
+```
+
+**3. The ROS2 workspace** (only needed for the xacro→SDF conversion in
+part 2 below, or eventually building the control node) — build with the
+venv's `python3` *not* shadowing the system one, since `ament`/
+`catkin_pkg` need the system Python, not the isolated venv:
+
+```bash
+cd ros2_ws
+PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '\.venv' | paste -sd:) VIRTUAL_ENV= colcon build --symlink-install
+source install/setup.bash
+```
+
+The xacro→SDF conversion below shells out to `xacro`/`gz sdf -p`, which
+needs this build to already exist and must run with the venv stripped
+from `PATH` for the same reason.
+
+**Do not** install `stable-baselines3`/`gymnasium`/training-time `opencv`
+into whatever Python interpreter `colcon build`/`ros2 run` resolves to —
+`colcon build` won't do this for you anyway (see below), and it risks
+the `cv2` conflict above with anything else in that environment. Only
+the future control node's minimal runtime deps (`stable-baselines3` for
+`.load()`/`.predict()`, `torch`) should ever need to land there, and only
+once that node actually exists.
+
 ## Why the ROS2-node conversion was scrapped
 
 - Training is a one-shot, offline, batch process (run it, get a
